@@ -9,6 +9,7 @@ class RuntimeState:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.i = 0
         self.debug = False
         self.info = "init"
         self.mark = "+"
@@ -22,6 +23,7 @@ class RuntimeState:
         # 标记“刚完成标定，等待用户点击继续运行”。
         self.calibration_updated = False
         # 点赞流程计数器：用于“每N次主流程触发一次点赞”。
+        # 与 self.i 分离，避免影响原有“循环暂停提示”的计数逻辑。
         self.like_cycle_count = 0
 
     def set_status(self, text):

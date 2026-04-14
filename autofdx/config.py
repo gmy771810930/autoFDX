@@ -13,10 +13,6 @@ CALIBRATION_ITEMS = [
     ("start", "开始按钮"),
     ("cum2", "高潮按钮"),
     ("finish", "再来一次按钮"),
-    ("experiment_selected_flag", "实验选定标志"),
-    ("experiment_switch", "实验卡片"),
-    ("experiment_hex_switch", "实验分类"),
-    ("body_part_switch", "身体部位"),
     ("bar_female", "女进度条"),
     ("bar_male", "男进度条"),
     ("scroll_area", "调速区域"),
@@ -46,7 +42,6 @@ def build_default_config():
             "finish": 0.95,
             "cum1": 0.95,
             "cum2": 0.95,
-            "experiment_selected_flag": 0.95,
         },
         "template_search_margin": 40,
         "template_regions": {},
@@ -63,25 +58,8 @@ def build_default_config():
         "ui_window_pos": [20, 20],
         "custom_templates": {},
         "like_points": [],
-        # 实验切换网格（3x4，共 12 点）：
-        # - experiment_points: 按“从左到右、从上到下”顺序存储 12 个点（归一化坐标）。
-        # - current_experiment: 当前实验索引，采用 [行, 列]（1-based）表示。
-        "experiment_points": [],
-        "current_experiment": [1, 1],
-        # 六边形实验切换网格（按行点数 6-6-6-1）：
-        # - experiment_hex_points: 按“从左到右、从上到下”保存中心点。
-        # - current_hex_experiment: 当前索引，仍用 [行, 列]（1-based）表示。
-        "experiment_hex_points": [],
-        "current_hex_experiment": [1, 1],
-        # 身体部位入口（单行 7 点）：
-        # body_part_points 按从左到右保存中心点。
-        "body_part_points": [],
-        "current_body_part": 1,
         "like_enabled": True,
         "like_force_next": False,
-        # 实验切换总开关：
-        # False=沿用原有流程；True=运行前先执行“实验切换预处理流程”。
-        "experiment_switch_enabled": False,
         # 叠加层模式开关（预留）：
         # False=常规悬浮窗；True=用户选择 DX Hook/Overlay 路径（实验项）。
         "overlay_dx_hook_enabled": False,
@@ -90,14 +68,6 @@ def build_default_config():
             "start": [0.35, 0.82, 0.45, 0.89],
             "cum2": [0.45, 0.82, 0.55, 0.89],
             "finish": [0.55, 0.82, 0.65, 0.89],
-            # 实验选定标志：和开始按钮同类，保存模板图与匹配区域。
-            "experiment_selected_flag": [0.03, 0.02, 0.10, 0.12],
-            # 实验切换联合标定网的默认包围框（行列均匀分布由 UI 侧计算）。
-            "experiment_switch": [0.30, 0.25, 0.70, 0.55],
-            # 六边形网格标定默认包围框（6-6-6-1 中心点由 UI 侧计算）。
-            "experiment_hex_switch": [0.08, 0.10, 0.92, 0.90],
-            # 身体部位标定默认包围框（单行 7 点中心由 UI 侧计算）。
-            "body_part_switch": [0.10, 0.10, 0.92, 0.24],
             "bar_female": [0.07, 0.75, 0.18, 0.79],
             "bar_male": [0.07, 0.79, 0.18, 0.83],
             "scroll_area": [0.46, 0.42, 0.54, 0.58],
@@ -178,17 +148,6 @@ class ConfigStore:
         # 点赞开关与“下一次立即点赞”标记补默认值。
         self.data.setdefault("like_enabled", True)
         self.data.setdefault("like_force_next", False)
-        # 实验切换总开关补默认值。
-        self.data.setdefault("experiment_switch_enabled", False)
-        # 实验切换：补齐当前实验索引与 12 点网格数据。
-        self.data.setdefault("current_experiment", [1, 1])
-        self.data.setdefault("experiment_points", [])
-        # 六边形实验切换：补齐当前索引与中心点网格数据。
-        self.data.setdefault("current_hex_experiment", [1, 1])
-        self.data.setdefault("experiment_hex_points", [])
-        # 身体部位：补齐当前索引与中心点网格数据。
-        self.data.setdefault("current_body_part", 1)
-        self.data.setdefault("body_part_points", [])
         # DX Hook/Overlay 选择项补默认值。
         self.data.setdefault("overlay_dx_hook_enabled", False)
 
