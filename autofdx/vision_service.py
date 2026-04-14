@@ -109,10 +109,41 @@ class VisionService:
             y2 = int(ny2 * height)
             x1, x2 = sorted((max(0, x1), min(width, x2)))
             y1, y2 = sorted((max(0, y1), min(height, y2)))
+            # 默认搜索框：标定区域 + 全局冗余边距。
             sx1 = max(0, x1 - margin)
             sy1 = max(0, y1 - margin)
             sx2 = min(width, x2 + margin)
             sy2 = min(height, y2 + margin)
+
+            # 特殊规则（按需求）：
+            # “实验选定标志”在标定后不再严格限制在原区域，
+            # 允许相对“标定框尺寸”发生更大偏移：
+            # - 横向允许偏移 2x 本身宽度（左右都放宽）；
+            # - 纵向允许偏移 0.5x 本身高度（上下都放宽）。
+            #
+            # 说明：
+            # 1) 这里用的是“标定区域本身”的宽高，而非整窗宽高，符合“本身宽/高”的语义；
+            # 2) 采用在默认搜索框基础上的并集扩张（取更宽边界），
+            #    保留原有 margin 机制，同时实现更宽容的匹配范围；
+            # 3) 对其他模板不生效，避免引入额外误检风险。
+            if template_name == "experiment_selected_flag":
+                region_w = max(1, x2 - x1)
+                region_h = max(1, y2 - y1)
+                extra_x = int(region_w * 2.0)
+                extra_y = int(region_h * 0.5)
+                sx1 = max(0, min(sx1, x1 - extra_x))
+                sy1 = max(0, min(sy1, y1 - extra_y))
+                sx2 = min(width, max(sx2, x2 + extra_x))
+                sy2 = min(height, max(sy2, y2 + extra_y))
+
+                if self.runtime_state.debug:
+                    print(
+                        template_name,
+                        "expanded-region",
+                        f"base=({x1},{y1},{x2},{y2})",
+                        f"extra=({extra_x},{extra_y})",
+                        f"search=({sx1},{sy1},{sx2},{sy2})",
+                    )
             if sx2 > sx1 and sy2 > sy1:
                 local_img = pyautogui.screenshot(region=(left + sx1, top + sy1, sx2 - sx1, sy2 - sy1))
                 local_gray = cv2.cvtColor(np.array(local_img), cv2.COLOR_RGB2GRAY)
@@ -225,15 +256,16 @@ class VisionService:
         area_ratio = float(np.count_nonzero(mask)) / float(mask.size)
         bin_mask = (mask > 0).astype(np.uint8)
 
-        # 先做一次形态学开运算，去掉零散噪点。
+        # 先开运算去噪点，再闭运算连接断裂的填充区域，减轻单帧闪烁导致的填充率跳变。
         kernel = np.ones((3, 3), np.uint8)
         clean = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN, kernel)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
 
-        # 每列红色占比，超过阈值视为“该列已填充”。
+        # 每列“填充像素占比”，阈值略提高可减少边缘噪声列被误判为已填充。
         col_ratio = np.mean(clean, axis=0)
-        active_cols = np.where(col_ratio > 0.25)[0]
+        active_cols = np.where(col_ratio > 0.30)[0]
         if active_cols.size == 0:
-            return area_ratio * 0.5
+            return float(np.clip(area_ratio * 0.5, 0.0, 1.0))
 
         # 找连续段，优先取“最靠左且足够长”的段，符合进度条从左往右填充的特点。
         splits = np.where(np.diff(active_cols) > 1)[0]
@@ -254,8 +286,9 @@ class VisionService:
             _, e = candidate
             length_ratio = float(e + 1) / float(mask.shape[1])
 
-        # 以长度为主、面积为辅。
-        return 0.65 * length_ratio + 0.35 * area_ratio
+        # 以长度为主、面积为辅；结果限制在 [0,1]，避免异常帧拉高/拉低 diff。
+        score = 0.65 * length_ratio + 0.35 * area_ratio
+        return float(np.clip(score, 0.0, 1.0))
 
 
 def sample_hsv_profile(crop_bgr):

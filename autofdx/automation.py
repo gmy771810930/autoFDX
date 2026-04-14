@@ -3,15 +3,6 @@ from time import sleep, time
 
 import keyboard
 import pyautogui
-import winsound
-
-
-def compare_bars(v1, v2):
-    if v1 > v2:
-        return 1
-    if v1 < v2:
-        return 2
-    return 0
 
 
 class AutomationEngine:
@@ -24,6 +15,7 @@ class AutomationEngine:
         self.vision_service = vision_service
         self.actions = actions
         self._f1_hotkey_handle = None
+        self._f2_hotkey_handle = None
         # 滚轮副线程控制状态：
         # 主线程负责识别与点击；副线程仅根据主线程下发的滚轮指令持续滚动。
         self._scroll_stop_event = threading.Event()
@@ -32,9 +24,202 @@ class AutomationEngine:
         self._scroll_amount = 0
         self._scroll_batch = 0
         self._scroll_thread = None
+        # “实验切换”流程状态：
+        # - _experiment_switch_bootstrapped: 当前实验是否已“选定+部署完成”，可直接跑主流程。
+        # - _experiment_first_stage_done: 是否已完成“首次启动运行”（E/实验分类/身体部位）阶段。
+        # - _experiment_card_index: 当前准备点击的实验卡片索引（1-based，1~12）。
+        self._experiment_switch_bootstrapped = False
+        self._experiment_card_index = self._read_card_index_from_config()
+        self._experiment_first_stage_done = False
+        # 实验切换模式下的“当前实验已运行次数”计数器：
+        # 每满 5 次自动顺延到下一个实验卡片，并重新进入“尝试选定实验”。
+        self._experiment_cycle_count = 0
+        # 标记“本轮已由其他流程提前按过 E 打开面板”，
+        # 供 _run_experiment_switch_bootstrap 的重入路径去重使用，避免重复按 E。
+        self._experiment_panel_preopened = False
+        # F2 手动切换意图：
+        # True 表示“用户已按 F2，且当前已暂停；当用户恢复后，应立即调起下一实验切换”。
+        # 该标记只负责“恢复后立即切换”的一次性触发，执行后会立刻清零。
+        self._f2_pending_switch_after_resume = False
         # 降低 pyautogui 全局动作间隔，避免滚轮动作被库默认节流。
         # 调整为 0：进一步提升连续滚轮吞吐，解决“滚动距离/次数偏小”的问题。
         pyautogui.PAUSE = 0
+
+    def _read_card_index_from_config(self):
+        """
+        从 current_experiment([行,列])推导实验卡片一维索引（1~12）。
+        非法配置自动回退到 1。
+        """
+        cur = self.config_store.data.get("current_experiment", [1, 1])
+        if (not isinstance(cur, list)) or len(cur) != 2:
+            return 1
+        row, col = cur[0], cur[1]
+        if (not isinstance(row, int)) or (not isinstance(col, int)):
+            return 1
+        if row < 1 or row > 3 or col < 1 or col > 4:
+            return 1
+        return (row - 1) * 4 + col
+
+    def _save_card_index_to_config(self, idx_1based):
+        """
+        将实验卡片一维索引写回 current_experiment([行,列])，便于 UI 与配置同步展示。
+        """
+        idx = max(1, min(12, int(idx_1based)))
+        row = (idx - 1) // 4 + 1
+        col = (idx - 1) % 4 + 1
+        cur = self.config_store.data.get("current_experiment", [1, 1])
+        if cur != [row, col]:
+            self.config_store.data["current_experiment"] = [row, col]
+            self.config_store.save()
+
+    def _missing_experiment_switch_calibrations(self):
+        """
+        返回“实验切换流程”缺失的标定项 key 列表。
+        除 calibration_done 外，也会校验网格点数量是否完整。
+        """
+        done_map = self.config_store.data.get("calibration_done", {})
+        missing = []
+        required_flags = (
+            "experiment_selected_flag",
+            "experiment_switch",
+            "experiment_hex_switch",
+            "body_part_switch",
+        )
+        for key in required_flags:
+            if not bool(done_map.get(key, False)):
+                missing.append(key)
+
+        if len(self.config_store.data.get("experiment_points", [])) != 12 and "experiment_switch" not in missing:
+            missing.append("experiment_switch")
+        if len(self.config_store.data.get("experiment_hex_points", [])) != 19 and "experiment_hex_switch" not in missing:
+            missing.append("experiment_hex_switch")
+        if len(self.config_store.data.get("body_part_points", [])) != 7 and "body_part_switch" not in missing:
+            missing.append("body_part_switch")
+        return missing
+
+    def _ensure_experiment_switch_ready(self):
+        """
+        实验切换前置校验：
+        开关开启时，必须先完成实验相关标定，否则强制保持暂停。
+        """
+        if not bool(self.config_store.data.get("experiment_switch_enabled", False)):
+            return True
+
+        missing = self._missing_experiment_switch_calibrations()
+        if not missing:
+            return True
+
+        self.state.manual_pause = True
+        self.state.set_status("实验切换缺少标定")
+        print(f"\n[实验切换] 缺少标定项：{', '.join(missing)}，已自动暂停。")
+        return False
+
+    def _run_experiment_switch_bootstrap(self):
+        """
+        实验切换开启后的首次运行流程：
+        1) 按 E -> 点实验分类 2 号 -> 点身体部位 2 号；
+        2) 尝试选定实验卡片（从当前索引开始）；
+        3) 选定后尝试部署（最多 5 轮）；
+        4) 部署失败则右键一次并顺延实验卡片，回到步骤 2。
+        """
+        if self._experiment_switch_bootstrapped:
+            return True
+
+        if not self._ensure_experiment_switch_ready():
+            return False
+
+        # “首次启动运行”阶段只执行一次；
+        # 后续自动切换实验时，直接回到“尝试选定实验”阶段，不重复按 E/点分类/点身体部位。
+        if not self._experiment_first_stage_done:
+            self.state.set_status("首次启动运行")
+            # 按需求：首次进入时从实验卡片 1 号点开始。
+            self._experiment_card_index = 1
+            self._save_card_index_to_config(self._experiment_card_index)
+            self.actions.press_experiment_switch_hotkey()
+            # 按需求：按下 E 后等待 500ms，再点击实验分类。
+            sleep(0.5)
+            if not self.actions.click_experiment_category(2):
+                self.state.manual_pause = True
+                self.state.set_status("实验切换失败: 实验分类点位不可用")
+                return False
+            # 按需求：点击实验分类后等待 500ms，再点击身体部位。
+            sleep(0.5)
+            # 按当前需求，身体部位仅使用 2 号与 5 号；首次启动固定先点 2 号。
+            if not self.actions.click_body_part(2):
+                self.state.manual_pause = True
+                self.state.set_status("实验切换失败: 身体部位点位不可用")
+                return False
+            self._experiment_first_stage_done = True
+        else:
+            # 非首次重入“尝试选定实验”：
+            # - 若前序流程已提前按过 E（例如：5 回合切换/部署失败回退），这里不重复按；
+            # - 否则按一次 E 打开实验面板。
+            if self._experiment_panel_preopened:
+                self._experiment_panel_preopened = False
+            else:
+                self.state.set_status("重新打开实验面板")
+                self.actions.press_experiment_switch_hotkey()
+                sleep(0.5)
+
+        while (not self.state.stop_requested) and (self.state.pending_calibration is None):
+            if self._wait_if_paused_or_interrupted():
+                return False
+            self.state.set_status("尝试选定实验")
+            if self._experiment_card_index > 12:
+                self.state.manual_pause = True
+                self.state.set_status("实验已用尽（待实现）")
+                print(
+                    f"\n[实验切换] 已暂停：实验卡片索引={self._experiment_card_index} 超出上限12，"
+                    "进入“实验已用尽（待实现）”。"
+                )
+                return False
+
+            self._save_card_index_to_config(self._experiment_card_index)
+            # 文档要求：点击实验卡片前先延时 500ms。
+            sleep(0.5)
+            print(f"\n[实验切换] 尝试选定实验：准备点击实验卡片索引={self._experiment_card_index}。")
+            clicked = self.actions.click_experiment_card(self._experiment_card_index)
+            if not clicked:
+                self.state.manual_pause = True
+                self.state.set_status("实验切换失败: 实验卡片点位不可用")
+                print(
+                    f"\n[实验切换] 已暂停：实验卡片点位不可用，当前索引={self._experiment_card_index}。"
+                )
+                return False
+
+            # 文档要求：点击实验卡片后等待 1000ms 检测实验选定标志。
+            if not self.actions.wait_experiment_selected_flag(timeout_sec=1.0):
+                # 按你的规则：未出现“实验选定标志”直接进入“实验已用尽（待实现）”。
+                self.state.manual_pause = True
+                self.state.set_status("实验已用尽（待实现）")
+                print(
+                    f"\n[实验切换] 已暂停：点击卡片索引={self._experiment_card_index} 后，"
+                    "1s内未检测到“实验选定标志”（按规则视为实验已用尽）。"
+                )
+                return False
+
+            self.state.set_status("尝试部署实验")
+            deployed = self.actions.deploy_experiment_with_retry(wait_start_sec=1.0)
+            if deployed:
+                self._experiment_switch_bootstrapped = True
+                self._experiment_cycle_count = 0
+                self.state.set_status("实验切换完成")
+                print(f"\n[实验切换] 部署成功：实验卡片索引={self._experiment_card_index}。")
+                return True
+
+            # 部署失败（1s 内未出现开始按鈕）：直接执行「切换下一实验」。
+            print(
+                f"\n[实验切换] 部署失败：索引={self._experiment_card_index}，"
+                "顺延到下一卡片并进入「切换下一实验」。"
+            )
+            self._experiment_card_index += 1
+            # 「切换下一实验」：ESC → 延时1000ms → E → 等待1s。
+            pyautogui.press("esc")
+            sleep(1.0)
+            self.actions.press_experiment_switch_hotkey()
+            sleep(1.0)
+
+        return False
 
     def _scroll_worker_loop(self):
         """
@@ -82,9 +267,6 @@ class AutomationEngine:
             self._scroll_amount = 0
             self._scroll_batch = 0
 
-    def play_sound(self):
-        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS)
-
     def _toggle_pause_by_f1(self):
         """
         F1 紧急开关：
@@ -101,37 +283,156 @@ class AutomationEngine:
             self.state.set_status("F1紧急暂停")
             print("\n[F1] 已暂停自动流程。")
         else:
-            self.state.set_status("F1恢复运行")
-            print("\n[F1] 已恢复自动流程。")
+            # 若此前由 F2 声明了“恢复后立即切换下一实验”，
+            # 则恢复状态文案要明确提示“下一步会先切换”，避免用户误判脚本会先继续当前实验。
+            if self._f2_pending_switch_after_resume:
+                self.state.set_status("F1恢复运行，准备切换下一实验")
+                print("\n[F1] 已恢复自动流程，将立即切换下一实验。")
+            else:
+                self.state.set_status("F1恢复运行")
+                print("\n[F1] 已恢复自动流程。")
+
+    def _wait_if_paused_or_interrupted(self):
+        """
+        在流程执行中统一处理“暂停/中断”：
+        - stop_requested 或进入标定（pending_calibration）时，返回 True 让上层中断当前流程；
+        - manual_pause 时阻塞等待，直到用户恢复；
+        - 若恢复后存在 F2 的“立即切换下一实验”请求，返回 True 终止当前阶段，
+          让主循环马上进入“切换下一实验”分支。
+        """
+        if self.state.stop_requested or self.state.pending_calibration is not None:
+            return True
+
+        while self.state.manual_pause:
+            if self.state.stop_requested or self.state.pending_calibration is not None:
+                return True
+            sleep(0.1)
+        # 关键点：F2 触发后，恢复时立即打断当前阶段，避免继续执行旧流程，
+        # 从而保证“恢复后马上调起切换下一实验”。
+        if self._f2_pending_switch_after_resume:
+            return True
+        return False
+
+    def _pause_and_switch_next_experiment_by_f2(self):
+        """
+        F2 快捷操作（新规则）：
+        - 立即进入暂停；
+        - 打上“恢复后立即切换下一实验”的一次性标记；
+        - 用户恢复（通常按 F1）后，主循环会优先执行切换分支。
+        """
+        experiment_switch_enabled = bool(self.config_store.data.get("experiment_switch_enabled", False))
+        self.state.manual_pause = True
+        if not experiment_switch_enabled:
+            # 未开启实验切换时不保留待切换标记，避免恢复后触发无意义分支。
+            self._f2_pending_switch_after_resume = False
+            self.state.set_status("F2已暂停（实验切换未开启）")
+            print("\n[F2] 已暂停；当前未开启实验切换，恢复后不会执行切换。")
+            return
+        self._f2_pending_switch_after_resume = True
+        self.state.set_status("F2已暂停，恢复后切换下一实验")
+        print("\n[F2] 已暂停，恢复后将立即切换下一实验。")
+
+    def _switch_next_experiment_after_f2_resume(self):
+        """
+        仅用于 F2 场景下“恢复后立即切换下一实验”：
+        - 实验卡片顺延一次；
+        - 实验计数清零；
+        - 不等待 2s，直接执行【切换下一实验】定义动作：
+          ESC -> 延迟 1000ms -> E -> 等待 1s；
+        - 标记面板已预开，避免 bootstrap 重复按 E。
+        """
+        self._experiment_cycle_count = 0
+        self._experiment_card_index += 1
+        self._experiment_switch_bootstrapped = False
+        self.state.set_status("F2恢复后：切换下一实验")
+        pyautogui.press("esc")
+        sleep(1.0)
+        self.actions.press_experiment_switch_hotkey()
+        sleep(1.0)
+        self._experiment_panel_preopened = True
+
+    def _reopen_experiment_panel_with_esc(self):
+        """
+        仅用于“正常 5 回合切换实验”前的动作：
+        点赞结束后，先等待 2s；
+        再按 ESC 退出当前实验；
+        延迟 1000ms 后按 E 打开实验面板；
+        最后再等待 1s，交由后续流程进入“尝试选定实验”阶段。
+        """
+        sleep(2.0)
+        pyautogui.press("esc")
+        sleep(1.0)
+        self.actions.press_experiment_switch_hotkey()
+        sleep(1.0)
 
     def _register_hotkeys(self):
         # suppress=False 保持 F1 原生行为不被拦截，仅增加脚本暂停能力。
         if self._f1_hotkey_handle is None:
             self._f1_hotkey_handle = keyboard.add_hotkey("f1", self._toggle_pause_by_f1, suppress=False)
+        if self._f2_hotkey_handle is None:
+            self._f2_hotkey_handle = keyboard.add_hotkey("f2", self._pause_and_switch_next_experiment_by_f2, suppress=False)
 
     def _unregister_hotkeys(self):
         if self._f1_hotkey_handle is not None:
             keyboard.remove_hotkey(self._f1_hotkey_handle)
             self._f1_hotkey_handle = None
+        if self._f2_hotkey_handle is not None:
+            keyboard.remove_hotkey(self._f2_hotkey_handle)
+            self._f2_hotkey_handle = None
 
     def loop_once(self):
-        # 进度条平衡容差：
-        # 两条进度条填充率差值在该范围内视为“已基本同步”，不再滚动。
-        bar_balance_tolerance = 0.006
-        balance_check_interval_sec = 0.4
+        experiment_switch_enabled = bool(self.config_store.data.get("experiment_switch_enabled", False))
+        # F2 一次性“恢复后切换”入口：
+        # 该分支优先级最高，确保恢复后先切换，再决定是否进入主流程。
+        if self._f2_pending_switch_after_resume:
+            if not experiment_switch_enabled:
+                # 若恢复前用户关闭了开关，则取消这次待切换请求，避免误动作。
+                self._f2_pending_switch_after_resume = False
+                self.state.set_status("F2待切换取消：实验切换未开启")
+                sleep(0.2)
+                return
+            if not self._ensure_experiment_switch_ready():
+                sleep(0.2)
+                return
+            self._switch_next_experiment_after_f2_resume()
+            self._f2_pending_switch_after_resume = False
+            return
+
+        if not experiment_switch_enabled:
+            # 开关关闭时重置“首次启动运行”状态；下次再开启会重新走首次流程。
+            self._experiment_switch_bootstrapped = False
+            self._experiment_card_index = self._read_card_index_from_config()
+            self._experiment_first_stage_done = False
+            self._experiment_cycle_count = 0
+        else:
+            if not self._ensure_experiment_switch_ready():
+                sleep(0.2)
+                return
+            if not self._run_experiment_switch_bootstrap():
+                sleep(0.2)
+                return
+
+        # 进度条平衡容差（作用于平滑后的 diff，见下方 EMA）：
+        # 单帧 HSV 掩码易抖动，若死区过小会在阈值两侧来回穿越 → 滚轮方向频繁反转“抽风”。
+        bar_balance_tolerance = 0.014
+        balance_check_interval_sec = 0.45
         next_balance_check_at = time()
+        # 双进度条填充率的指数平滑：降低单帧噪声对 diff 的影响。
+        bar_fill_ema_b1 = None
+        bar_fill_ema_b2 = None
+        bar_fill_ema_alpha = 0.38
         # 强约束：默认关闭滚轮，仅在“点击开始后~点击高潮前”临时开启。
         self._scroll_enabled = False
         self._clear_scroll_command()
 
         while not self.actions.ready_to_start():
-            if self.state.should_interrupt():
+            if self._wait_if_paused_or_interrupted():
                 return
             self.state.log("等待开始")
             sleep(0.2)
 
         while self.actions.ready_to_start():
-            if self.state.should_interrupt():
+            if self._wait_if_paused_or_interrupted():
                 return
             self.actions.start()
             self.state.log("点击开始")
@@ -143,7 +444,7 @@ class AutomationEngine:
         self._scroll_enabled = True
         try:
             while not self.actions.ready_to_cum():
-                if self.state.should_interrupt():
+                if self._wait_if_paused_or_interrupted():
                     return
                 self.state.log("等待高潮")
                 now = time()
@@ -153,41 +454,55 @@ class AutomationEngine:
                 # - b2 = 男进度条（原下方进度条）
                 if now >= next_balance_check_at:
                     b1, b2 = self.vision_service.detect_bars(self.vision_service.capture_screen())
-                    diff = b1 - b2
+                    # EMA：用平滑后的填充率算 diff，抑制单帧跳变导致的纠偏方向抖动。
+                    if bar_fill_ema_b1 is None:
+                        bar_fill_ema_b1, bar_fill_ema_b2 = b1, b2
+                    else:
+                        a = bar_fill_ema_alpha
+                        bar_fill_ema_b1 = a * b1 + (1.0 - a) * bar_fill_ema_b1
+                        bar_fill_ema_b2 = a * b2 + (1.0 - a) * bar_fill_ema_b2
+                    diff = bar_fill_ema_b1 - bar_fill_ema_b2
                     if self.state.debug:
-                        print(f"\n[bar] female(top)={b1:.4f} male(bottom)={b2:.4f} diff={diff:.4f}")
+                        print(
+                            f"\n[bar] raw f={b1:.4f} m={b2:.4f} | "
+                            f"ema f={bar_fill_ema_b1:.4f} m={bar_fill_ema_b2:.4f} diff={diff:.4f}"
+                        )
 
-                    # 只要差值超出容差，就按差值大小进行“持续微调”。
-                    # 宗旨：让两条进度条逐步趋同，而不是只在方向变化时调一次。
+                    # 仅当平滑后的 |diff| 超出死区才纠偏；力度随 |diff| 分档，并整体压低批次避免过冲。
                     if abs(diff) > bar_balance_tolerance:
                         self.actions.move_to_scroll_region_center()
 
-                        # 差值越大，滚动次数越多；按“更激进档”提升每轮滚动总量。
-                        if abs(diff) > 0.15:
-                            scroll_count = 36
-                        elif abs(diff) > 0.10:
-                            scroll_count = 28
-                        elif abs(diff) > 0.06:
+                        ad = abs(diff)
+                        # 分档略收敛：原先单档最高 36+8 易过冲振荡。
+                        if ad > 0.15:
                             scroll_count = 22
-                        elif abs(diff) > 0.03:
-                            scroll_count = 16
-                        else:
+                        elif ad > 0.10:
+                            scroll_count = 18
+                        elif ad > 0.06:
+                            scroll_count = 14
+                        elif ad > 0.03:
                             scroll_count = 10
-
-                        # 临近满条时，轻微差值也会导致失败，额外加大纠偏力度。
-                        if max(b1, b2) > 0.85 and abs(diff) > bar_balance_tolerance:
-                            scroll_count += 8
-
-                        if diff > 0:
-                            # 女进度条(上) > 男进度条(下)：向上滚动，提高男进度条速度。
-                            if self.state.debug:
-                                print(f"[bar] action=scroll_up count={scroll_count}")
-                            self._set_scroll_command(+360, scroll_count)
                         else:
-                            # 男进度条(下) > 女进度条(上)：向下滚动，降低男进度条速度。
+                            scroll_count = 6
+
+                        # 临近满条时略加大纠偏，但增量减半以减轻末端抖动。
+                        if max(bar_fill_ema_b1, bar_fill_ema_b2) > 0.85 and abs(diff) > bar_balance_tolerance:
+                            scroll_count += 4
+
+                        scroll_count = max(4, min(26, scroll_count))
+
+                        # pyautogui.scroll 的正负与部分游戏/引擎（含本游戏）对滚轮方向的约定相反：
+                        # 此前女落后男时本应“向下”纠偏却表现为向上，故在此对纠偏方向取反。
+                        if diff > 0:
+                            # 女进度条(上) > 男进度条(下)：需提高男侧相对速度 → 向游戏内“下滚”一侧纠偏。
                             if self.state.debug:
-                                print(f"[bar] action=scroll_down count={scroll_count}")
+                                print(f"[bar] action=scroll_down (female ahead) count={scroll_count}")
                             self._set_scroll_command(-360, scroll_count)
+                        else:
+                            # 男进度条(下) > 女进度条(上)：女落后 → 向游戏内“上滚”一侧纠偏。
+                            if self.state.debug:
+                                print(f"[bar] action=scroll_up (female behind) count={scroll_count}")
+                            self._set_scroll_command(+360, scroll_count)
                     else:
                         # 差值已在容差内：暂停副线程滚轮输出，避免多余扰动。
                         self._clear_scroll_command()
@@ -200,7 +515,7 @@ class AutomationEngine:
             self._clear_scroll_command()
 
         while self.actions.ready_to_cum():
-            if self.state.should_interrupt():
+            if self._wait_if_paused_or_interrupted():
                 return
             self.actions.cum()
             self.state.log("点击高潮")
@@ -208,19 +523,18 @@ class AutomationEngine:
             self.actions.wait(0.1)
 
         while not self.actions.ready_to_finish():
-            if self.state.should_interrupt():
+            if self._wait_if_paused_or_interrupted():
                 return
             self.state.log("等待结束")
             self.actions.wait(0.2)
 
         while self.actions.ready_to_finish():
-            if self.state.should_interrupt():
+            if self._wait_if_paused_or_interrupted():
                 return
             self.actions.finish()
             self.state.log("点击结束")
             self.actions.wait(0.2)
             with self.state.lock:
-                self.state.i += 1
                 self.state.like_cycle_count += 1
 
             like_enabled = bool(self.config_store.data.get("like_enabled", True))
@@ -240,6 +554,21 @@ class AutomationEngine:
                     self.config_store.data["like_force_next"] = False
                     self.config_store.save()
 
+            # 新规则（按流程文档）：
+            # 在实验切换模式下，正常运行满 5 回合后，
+            # 先按“原有逻辑”处理点赞，再执行 ESC -> 500ms -> E，回到尝试选定实验。
+            if experiment_switch_enabled:
+                self._experiment_cycle_count += 1
+                if self._experiment_cycle_count >= 5:
+                    self._experiment_cycle_count = 0
+                    self._experiment_card_index += 1
+                    self._experiment_switch_bootstrapped = False
+                    self.state.set_status("实验5次完成，准备切换实验")
+                    self._reopen_experiment_panel_with_esc()
+                    # 标记本轮已按过 E，避免下次进入 bootstrap 重复按键。
+                    self._experiment_panel_preopened = True
+                    return
+
     def run_forever(self):
         self._register_hotkeys()
         self._start_scroll_worker()
@@ -256,37 +585,6 @@ class AutomationEngine:
                         self.state.set_status("手动暂停")
                     sleep(0.2)
                     continue
-
-                if self.state.i >= 5:
-                    self.state.set_status("循环暂停提示")
-                    print("\n____________\n已暂停程序，三秒后自动恢复。\n你可以按下空格中止程序")
-                    self.play_sound()
-                    start_time = time()
-                    space_pressed = False
-                    while time() - start_time < 5:
-                        if self.state.stop_requested or self.state.manual_pause or self.state.pending_calibration is not None:
-                            break
-                        if keyboard.is_pressed("space"):
-                            space_pressed = True
-                            print("____________\n已中止程序，等待按下回车键恢复程序")
-                            break
-                        sleep(0.1)
-
-                    if space_pressed:
-                        while True:
-                            if self.state.stop_requested or self.state.manual_pause or self.state.pending_calibration is not None:
-                                break
-                            if keyboard.is_pressed("enter"):
-                                print("____________\n已按下回车键，恢复程序")
-                                with self.state.lock:
-                                    self.state.i = 0
-                                break
-                            sleep(0.1)
-
-                    if (not space_pressed) and (time() - start_time >= 5):
-                        print("____________\n三秒内未按下空格键，继续执行程序")
-                        with self.state.lock:
-                            self.state.i = 0
 
                 try:
                     self.loop_once()
