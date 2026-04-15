@@ -22,6 +22,15 @@ class RuntimeState:
         self.pending_calibration = None
         # 标记“刚完成标定，等待用户点击继续运行”。
         self.calibration_updated = False
+        # F12 调试开关：绘制所有标定窗口叠加层。
+        self.show_all_calibration_overlay = False
+        # F12 调试流程状态机：
+        # idle -> await_selection -> ready_to_show -> showing -> idle
+        self.calibration_overlay_phase = "idle"
+        # UI 侧收到该标记后弹出“选择要显示的标定项”窗口。
+        self.open_calibration_overlay_selector = False
+        # F12 选中的标定项 key 列表，仅用于调试显示。
+        self.calibration_overlay_selected_keys = []
         # 点赞流程计数器：用于“每N次主流程触发一次点赞”。
         # 与 self.i 分离，避免影响原有“循环暂停提示”的计数逻辑。
         self.like_cycle_count = 0

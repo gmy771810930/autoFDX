@@ -39,6 +39,8 @@ class CalibrationOverlay:
         self.rect = [50, 50, 150, 120]
         self.point = [100, 100]
         self.point_radius = 8
+        # “拉出新实验滚动”专用输入：向下滚动距离（步数）。
+        self.scroll_distance_var = None
         self.drag_mode = None
         self.last_xy = (0, 0)
         self.game_left = self.game_top = self.game_width = self.game_height = 0
@@ -54,23 +56,177 @@ class CalibrationOverlay:
     def _is_like_item(self):
         return bool(self.item_key and self.item_key.startswith("like"))
 
+    def _is_pull_new_experiment_scroll_item(self):
+        return self.item_key == "pull_new_experiment_scroll"
+
+    def _is_point_mode_item(self):
+        """
+        点位模式项：
+        - 点赞项：只标定点击点
+        - 拉出新实验滚动：标定滚轮执行点
+        """
+        return self._is_like_item() or self._is_pull_new_experiment_scroll_item()
+
+    def _is_experiment_switch_item(self):
+        return self.item_key == "experiment_switch"
+
+    def _is_body_part_item(self):
+        return self.item_key == "body_part_switch"
+
+    def _build_experiment_grid_points(self):
+        """
+        基于当前矩形生成 3x4 联合网格点（像素坐标）。
+        约定：
+        - 横向 4 列（0~3），纵向 3 行（0~2）
+        - 从左到右、从上到下编号为 1~12
+        """
+        x1, y1, x2, y2 = self.rect
+        points = []
+        for row in range(3):
+            y = y1 + (y2 - y1) * (row / 2.0)
+            for col in range(4):
+                x = x1 + (x2 - x1) * (col / 3.0)
+                points.append([int(round(x)), int(round(y))])
+        return points
+
+    def _build_body_part_points(self):
+        """
+        生成“身体部位”单行 7 点中心坐标（像素坐标）。
+        点位按从左到右编号 1~7，对应顶部身体部位按钮序列。
+        """
+        x1, y1, x2, y2 = self.rect
+        cy = int(round((y1 + y2) / 2.0))
+        points = []
+        for col in range(7):
+            x = x1 + (x2 - x1) * (col / 6.0)
+            points.append([int(round(x)), cy])
+        return points
+
+    def _estimate_pull_scroll_distance_from_experiment_points(self, game_height):
+        """
+        基于“实验卡片 3x4 标定点”估算“向下滚动距离”默认值。
+
+        估算思路（尽量稳健）：
+        1) 实验卡片固定为 3 行：1~4、5~8、9~12；
+        2) 分别计算三行 y 的均值（归一化 -> 像素）；
+        3) 使用“两两行距”推导单行步长：
+           - d12 = row2-row1
+           - d23 = row3-row2
+           - d13/2 作为跨两行的折算步长
+        4) 取三者平均得到目标“单行像素位移”；
+        5) 按当前滚轮标定比例（1档=10滚轮单位）换算默认档位。
+
+        说明：
+        - 这是“默认值估算”，用于减少手工试错，不覆盖用户已保存的手填值。
+        - 若点位不完整或异常，返回 0 让输入框保持可手填。
+        """
+        points = self.config.get("experiment_points", [])
+        if (not isinstance(points, list)) or len(points) != 12:
+            return 0
+
+        row_y_means = []
+        for row_idx in range(3):
+            row = points[row_idx * 4 : row_idx * 4 + 4]
+            ys = []
+            for p in row:
+                if (not isinstance(p, list)) or len(p) != 2:
+                    return 0
+                y_norm = p[1]
+                if not isinstance(y_norm, (int, float)):
+                    return 0
+                ys.append(float(y_norm) * float(game_height))
+            row_y_means.append(sum(ys) / 4.0)
+
+        d12 = abs(row_y_means[1] - row_y_means[0])
+        d23 = abs(row_y_means[2] - row_y_means[1])
+        d13_half = abs(row_y_means[2] - row_y_means[0]) / 2.0
+        step_px = (d12 + d23 + d13_half) / 3.0
+        if step_px <= 0.0:
+            return 0
+
+        # 当前实现按“1档=10滚轮单位”执行，因此默认值也按同一比例换算。
+        estimated = int(round(step_px / 10.0))
+        return max(1, estimated)
+
+    def _build_center_rect_by_item(self, width, height):
+        """
+        为“未标定项”生成居中默认框，避免默认框落在边缘导致用户看不到。
+        按标定类型给出不同尺寸，保证可见性与可操作性。
+        """
+        if self._is_experiment_switch_item():
+            rw, rh = 0.45, 0.35
+        elif self._is_body_part_item():
+            rw, rh = 0.60, 0.16
+        else:
+            rw, rh = 0.20, 0.14
+
+        w = max(20, int(width * rw))
+        h = max(20, int(height * rh))
+        cx, cy = width // 2, height // 2
+        x1 = max(0, cx - w // 2)
+        y1 = max(0, cy - h // 2)
+        x2 = min(width, x1 + w)
+        y2 = min(height, y1 + h)
+        return [x1, y1, x2, y2]
+
     def open_for_item(self, item_key, item_label):
         if self.is_open():
             self.cancel()
         self.item_key = item_key
         self.item_label = item_label
+        self.scroll_distance_var = None
 
         left, top, width, height = self.window_service.get_window_region()
         self.game_left, self.game_top, self.game_width, self.game_height = left, top, width, height
         r = self.config["calibration_rects"].get(item_key, [0.4, 0.4, 0.5, 0.5])
         self.rect = [int(r[0] * width), int(r[1] * height), int(r[2] * width), int(r[3] * height)]
-        if self._is_like_item():
+        # 未完成标定时，统一以屏幕中心作为默认框位置，避免默认框在边缘不可见。
+        done_map = self.config.get("calibration_done", {})
+        if not bool(done_map.get(item_key, False)):
+            self.rect = self._build_center_rect_by_item(width, height)
+        if self._is_point_mode_item():
             # 点赞点位标定改为“单圆点模式”：
             # 兼容历史矩形数据，默认取矩形中心作为初始圆点位置。
             cx = int((self.rect[0] + self.rect[2]) / 2)
             cy = int((self.rect[1] + self.rect[3]) / 2)
             self.point = [cx, cy]
             self.rect = [cx - 1, cy - 1, cx + 1, cy + 1]
+            if self._is_pull_new_experiment_scroll_item():
+                # 优先读取历史动作点位，便于重复微调。
+                action = self.config.get("pull_new_experiment_scroll_action", {})
+                ax = action.get("x")
+                ay = action.get("y")
+                if isinstance(ax, (int, float)) and isinstance(ay, (int, float)):
+                    self.point = [int(ax * width), int(ay * height)]
+                    self.rect = [self.point[0] - 1, self.point[1] - 1, self.point[0] + 1, self.point[1] + 1]
+                # 读取“向下滚动距离”，供用户直接输入编辑。
+                # 若用户尚未配置（<=0），则基于“实验卡片3x4点位”的三行纵向距离估算默认值。
+                raw_dist = action.get("distance_down", action.get("distance", 0))
+                try:
+                    dist = max(0.0, float(raw_dist))
+                except Exception:
+                    dist = 0.0
+                if dist <= 0:
+                    dist = float(self._estimate_pull_scroll_distance_from_experiment_points(height))
+                dist_text = f"{dist:.2f}".rstrip("0").rstrip(".")
+                self.scroll_distance_var = tk.StringVar(value=dist_text)
+        elif self._is_experiment_switch_item():
+            # 若历史已存在 12 点实验网格，优先用历史点位反推矩形，
+            # 让用户二次标定时能在上次结果基础上微调。
+            exp_points = self.config.get("experiment_points", [])
+            if isinstance(exp_points, list) and len(exp_points) == 12:
+                px = [int(p[0] * width) for p in exp_points if isinstance(p, list) and len(p) == 2]
+                py = [int(p[1] * height) for p in exp_points if isinstance(p, list) and len(p) == 2]
+                if len(px) == 12 and len(py) == 12:
+                    self.rect = [min(px), min(py), max(px), max(py)]
+        elif self._is_body_part_item():
+            # 身体部位模式读取历史 7 点，便于二次标定时直接微调。
+            part_points = self.config.get("body_part_points", [])
+            if isinstance(part_points, list) and len(part_points) == 7:
+                px = [int(p[0] * width) for p in part_points if isinstance(p, list) and len(p) == 2]
+                py = [int(p[1] * height) for p in part_points if isinstance(p, list) and len(p) == 2]
+                if len(px) == 7 and len(py) == 7:
+                    self.rect = [min(px), min(py), max(px), max(py)]
 
         self.win = tk.Toplevel(self.root)
         self.win.title(f"标定: {item_label}")
@@ -79,8 +235,16 @@ class CalibrationOverlay:
         self.win.overrideredirect(True)
         self.win.geometry(f"{width}x{height}+{left}+{top}")
         self.win.attributes("-topmost", True)
-        self.win.configure(bg=BG_APP)
-        self.win.attributes("-alpha", 0.35)
+        if self._is_pull_new_experiment_scroll_item():
+            # 特殊规则：该标定项不使用暗色遮罩层。
+            # 通过 transparentcolor 仅保留绘制元素与控制面板，背景保持透明。
+            transparent_bg = "#ff00ff"
+            self.win.configure(bg=transparent_bg)
+            self.win.attributes("-transparentcolor", transparent_bg)
+        else:
+            self.win.configure(bg=BG_APP)
+            # 提升标定层整体可见度，避免边框/点位/文字过淡看不清。
+            self.win.attributes("-alpha", 0.48)
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
         # 让回车可直接应用，Esc 直接取消，提升标定操作效率。
         self.win.bind("<Return>", lambda _e: self.save())
@@ -91,54 +255,143 @@ class CalibrationOverlay:
         panel.place(x=10, y=10)
         tk.Button(panel, text="保存", command=self.save, bg=ACCENT, fg="white", relief="flat").pack(side="left", padx=4, pady=4)
         tk.Button(panel, text="取消", command=self.cancel, bg=BTN_DANGER, fg="white", relief="flat").pack(side="left", padx=4, pady=4)
-        tip_text = "左键点击/拖动圆点" if self._is_like_item() else "左键拖动/缩放"
+        if self._is_pull_new_experiment_scroll_item():
+            tk.Label(panel, text="向下滚动距离:", fg=FG_MAIN, bg=BG_SUBCARD).pack(side="left", padx=(8, 4))
+            entry = tk.Entry(panel, textvariable=self.scroll_distance_var, width=6)
+            entry.pack(side="left", padx=(0, 6))
+            tk.Label(panel, text="预览调试请按 F11", fg=FG_MAIN, bg=BG_SUBCARD).pack(side="left", padx=(4, 6))
+            # 打开时默认聚焦到输入框，便于直接录入距离。
+            entry.focus_set()
+        if self._is_like_item():
+            tip_text = "左键点击/拖动圆点"
+        elif self._is_pull_new_experiment_scroll_item():
+            tip_text = "左键定位执行点，填写向下滚动距离，按F11重播调试，回车保存"
+        elif self._is_experiment_switch_item():
+            tip_text = "左键拖动/缩放矩形，自动生成12点网格"
+        elif self._is_body_part_item():
+            tip_text = "左键拖动/缩放矩形，自动生成单行7个中心点"
+        else:
+            tip_text = "左键拖动/缩放"
         tk.Label(panel, text=f"正在标定：{item_label}（{tip_text}）", fg=FG_MAIN, bg=BG_SUBCARD).pack(
             side="left", padx=6
         )
+        # 避免标定操作面板遮挡目标框（特别是左上角小目标，如“实验选定标志”）。
+        # 若默认左上角面板与标定框重叠，则自动挪到窗口底部。
+        panel.update_idletasks()
+        panel_w = panel.winfo_width()
+        panel_h = panel.winfo_height()
+        panel_x = 10
+        panel_y = 10
+        rx1, ry1, rx2, ry2 = self.rect
+        overlap_x = not (panel_x + panel_w < rx1 or panel_x > rx2)
+        overlap_y = not (panel_y + panel_h < ry1 or panel_y > ry2)
+        if overlap_x and overlap_y and (not self._is_pull_new_experiment_scroll_item()):
+            panel_y = max(10, self.game_height - panel_h - 10)
+            panel.place_configure(x=panel_x, y=panel_y)
 
-        self.canvas = tk.Canvas(self.win, bg=BG_APP, highlightthickness=0)
+        canvas_bg = "#ff00ff" if self._is_pull_new_experiment_scroll_item() else BG_APP
+        self.canvas = tk.Canvas(self.win, bg=canvas_bg, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.redraw()
         self.canvas.bind("<ButtonPress-1>", self.on_left_down)
         self.canvas.bind("<B1-Motion>", self.on_left_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_up)
         self.canvas.bind("<Motion>", self.on_motion)
+        # 画布创建在后，可能遮住上方面板；显式提升面板层级确保输入控件可见可点。
+        panel.lift()
 
         self.state.manual_pause = True
         self.state.set_status(f"标定中: {item_label}")
 
-    def redraw(self):
-        self.canvas.delete("all")
-        if self._is_like_item():
-            # 点赞项使用圆点可视化，仅表达“点击坐标”，不再表达区域范围。
-            cx, cy = self.point
-            r = self.point_radius
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#00ff88", width=2)
-            self.canvas.create_line(cx - 14, cy, cx + 14, cy, fill="#00ff88", width=1)
-            self.canvas.create_line(cx, cy - 14, cx, cy + 14, fill="#00ff88", width=1)
-            self.canvas.create_text(
-                cx + 12,
-                cy - 12,
-                anchor="nw",
-                text=self.item_label,
-                fill="yellow",
-                font=("Microsoft YaHei UI", 11, "bold"),
-            )
-            return
-
-        x1, y1, x2, y2 = self.rect
-        self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00ff88", width=2)
+    def _draw_label_outside(self, target_rect, text):
+        """
+        将标签绘制在目标框/点位外侧，避免遮挡边框或定位点。
+        优先放在目标上方；若空间不足则放在下方。
+        """
+        x1, y1, x2, y2 = target_rect
+        top_y = y1 - 24
+        if top_y >= 4:
+            tx, ty = x1, top_y
+        else:
+            tx = x1
+            ty = min(max(4, y2 + 8), self.game_height - 24)
+        # 先画深色描边，再画亮色正文，提升复杂背景上的可读性。
         self.canvas.create_text(
-            x1 + 8,
-            y1 + 8,
+            tx + 1,
+            ty + 1,
             anchor="nw",
-            text=self.item_label,
-            fill="yellow",
+            text=text,
+            fill="#111827",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        self.canvas.create_text(
+            tx,
+            ty,
+            anchor="nw",
+            text=text,
+            fill="#ffe066",
             font=("Microsoft YaHei UI", 11, "bold"),
         )
 
+    def redraw(self):
+        self.canvas.delete("all")
+        if self._is_point_mode_item():
+            # 点位模式使用圆点可视化，仅表达“执行坐标”，不再表达区域范围。
+            cx, cy = self.point
+            r = self.point_radius
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#00ff88", width=3)
+            self.canvas.create_line(cx - 16, cy, cx + 16, cy, fill="#00ff88", width=2)
+            self.canvas.create_line(cx, cy - 16, cx, cy + 16, fill="#00ff88", width=2)
+            label = self.item_label
+            if self._is_pull_new_experiment_scroll_item():
+                dist = self._get_pull_scroll_distance_from_input()
+                label = f"{self.item_label} | 向下距离:{dist}"
+            self._draw_label_outside([cx - r, cy - r, cx + r, cy + r], label)
+            return
+
+        if self._is_experiment_switch_item():
+            x1, y1, x2, y2 = self.rect
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00ff88", width=3)
+            points = self._build_experiment_grid_points()
+            # 3x4 网格：统一横向/纵向间距，拖动矩形即可整体调整网格密度。
+            for idx, (px, py) in enumerate(points, start=1):
+                self.canvas.create_oval(px - 6, py - 6, px + 6, py + 6, outline="#00ff88", width=3)
+                self.canvas.create_text(
+                    px + 8,
+                    py - 8,
+                    anchor="nw",
+                    text=str(idx),
+                    fill="#ffe066",
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                )
+            cur_exp = self.config.get("current_experiment", [1, 1])
+            self._draw_label_outside([x1, y1, x2, y2], f"{self.item_label} 当前实验: ({cur_exp[0]},{cur_exp[1]})")
+            return
+
+        if self._is_body_part_item():
+            x1, y1, x2, y2 = self.rect
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00ff88", width=3)
+            points = self._build_body_part_points()
+            for idx, (px, py) in enumerate(points, start=1):
+                self.canvas.create_oval(px - 6, py - 6, px + 6, py + 6, outline="#00ff88", width=3)
+                self.canvas.create_text(
+                    px + 8,
+                    py - 8,
+                    anchor="nw",
+                    text=str(idx),
+                    fill="#ffe066",
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                )
+            cur_part = int(self.config.get("current_body_part", 1))
+            self._draw_label_outside([x1, y1, x2, y2], f"{self.item_label} 当前: {cur_part}")
+            return
+
+        x1, y1, x2, y2 = self.rect
+        self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00ff88", width=3)
+        self._draw_label_outside([x1, y1, x2, y2], self.item_label)
+
     def clamp(self):
-        if self._is_like_item():
+        if self._is_point_mode_item():
             # 圆点模式只需约束单点坐标，避免越界到游戏窗口外。
             px, py = self.point
             px = max(0, min(self.game_width - 1, px))
@@ -188,7 +441,7 @@ class CalibrationOverlay:
         return None
 
     def on_left_down(self, event):
-        if self._is_like_item():
+        if self._is_point_mode_item():
             # 圆点模式：按下即更新目标点并进入拖动。
             self.drag_mode = "point"
             self.point = [event.x, event.y]
@@ -206,7 +459,7 @@ class CalibrationOverlay:
         if self.drag_mode is None:
             return
 
-        if self._is_like_item() and self.drag_mode == "point":
+        if self._is_point_mode_item() and self.drag_mode == "point":
             self.point = [event.x, event.y]
             self.clamp()
             self.redraw()
@@ -236,7 +489,7 @@ class CalibrationOverlay:
         self.drag_mode = None
 
     def on_motion(self, event):
-        if self._is_like_item():
+        if self._is_point_mode_item():
             self.canvas.configure(cursor="crosshair")
             return
 
@@ -254,10 +507,25 @@ class CalibrationOverlay:
         }
         self.canvas.configure(cursor=cursor_map.get(mode, "arrow"))
 
+    def _get_pull_scroll_distance_from_input(self):
+        """
+        读取“拉出新实验滚动”的向下滚动距离输入并做兜底清洗：
+        - 空值/非法值统一回退 0；
+        - 负数统一钳制为 0；
+        - 支持小数（例如 8.5）。
+        """
+        if self.scroll_distance_var is None:
+            return 0.0
+        try:
+            value = float(str(self.scroll_distance_var.get()).strip())
+        except Exception:
+            value = 0.0
+        return max(0.0, value)
+
     def save(self):
         x1, y1, x2, y2 = self.rect
         norm = [x1 / self.game_width, y1 / self.game_height, x2 / self.game_width, y2 / self.game_height]
-        if self._is_like_item():
+        if self._is_point_mode_item():
             # 点赞项只保留单点：为了复用既有数据结构，写为零面积矩形 [x,y,x,y]。
             # 后续计算中心点时仍可得到准确点击坐标。
             self.clamp()
@@ -267,8 +535,18 @@ class CalibrationOverlay:
             norm = [nx, ny, nx, ny]
         self.config["calibration_rects"][self.item_key] = norm
 
-        # 只有需要图像的标定项才截图；点赞点位和滚动区域仅保存坐标，不截图。
-        need_screenshot = self.item_key in ("start", "cum2", "finish", "bar_female", "bar_male")
+        # 只有需要图像的标定项才截图；点赞点位和网格类标定仅保存坐标，不截图。
+        need_screenshot = self.item_key in (
+            "start",
+            "cum2",
+            "finish",
+            "experiment_selected_flag",
+            "recover_stamina_button",
+            "sensitive_progress_bar",
+            "special_action_button",
+            "bar_female",
+            "bar_male",
+        )
         screenshot = None
         if need_screenshot:
             # 截图前先临时隐藏标定层，避免把绘制矩形、提示文字、按钮一起截进去。
@@ -285,7 +563,15 @@ class CalibrationOverlay:
             )
 
         # 模板按钮：保存模板图 + 限定匹配区域
-        if self.item_key in ("start", "cum2", "finish"):
+        if self.item_key in (
+            "start",
+            "cum2",
+            "finish",
+            "experiment_selected_flag",
+            "recover_stamina_button",
+            "sensitive_progress_bar",
+            "special_action_button",
+        ):
             crop = screenshot[y1:y2, x1:x2]
             if crop.size > 0:
                 file_name = f"custom_{self.item_key}.png"
@@ -293,12 +579,15 @@ class CalibrationOverlay:
                 cv2.imwrite(str(PROJECT_ROOT / rel_path), crop)
                 self.config["custom_templates"][self.item_key] = rel_path
                 self.config["template_regions"][self.item_key] = norm
-        # 女进度条：独立保存区域与颜色采样
+        # 女进度条：独立保存区域与颜色采样（仅用于进度条纠偏）。
         elif self.item_key == "bar_female":
             self.config["bar_regions"]["bar1"] = norm
             c1 = screenshot[y1:y2, x1:x2]
             if c1.size > 0:
                 self.config["bar_profiles"]["bar1"] = sample_hsv_profile(c1)
+            # 清理历史版本遗留的“bar_female 模板匹配”配置，避免与进度条纠偏混用。
+            self.config["custom_templates"].pop("bar_female", None)
+            self.config["template_regions"].pop("bar_female", None)
         # 男进度条：独立保存区域与颜色采样
         elif self.item_key == "bar_male":
             self.config["bar_regions"]["bar2"] = norm
@@ -313,9 +602,75 @@ class CalibrationOverlay:
                 rr = self.config["calibration_rects"][f"like{idx}"]
                 points.append([(rr[0] + rr[2]) / 2, (rr[1] + rr[3]) / 2])
             self.config["like_points"] = points
+        elif self._is_pull_new_experiment_scroll_item():
+            # 记录滚轮执行参数：坐标 + 用户输入的“向下滚动距离”。
+            self.clamp()
+            px, py = self.point
+            distance_down = self._get_pull_scroll_distance_from_input()
+            self.config["pull_new_experiment_scroll_action"] = {
+                "x": px / self.game_width,
+                "y": py / self.game_height,
+                "distance_down": distance_down,
+            }
+        elif self._is_experiment_switch_item():
+            # 将矩形内 3x4 网格点保存为归一化坐标，顺序固定为 1~12：
+            # 1~4 第一行，5~8 第二行，9~12 第三行。
+            exp_points = []
+            for px, py in self._build_experiment_grid_points():
+                exp_points.append([px / self.game_width, py / self.game_height])
+            self.config["experiment_points"] = exp_points
+            # 若当前实验索引缺失/非法，回落到 (1,1)。
+            cur_exp = self.config.get("current_experiment", [1, 1])
+            if (
+                (not isinstance(cur_exp, list))
+                or len(cur_exp) != 2
+                or (not isinstance(cur_exp[0], int))
+                or (not isinstance(cur_exp[1], int))
+                or cur_exp[0] < 1
+                or cur_exp[0] > 3
+                or cur_exp[1] < 1
+                or cur_exp[1] > 4
+            ):
+                self.config["current_experiment"] = [1, 1]
+        elif self._is_body_part_item():
+            part_points = []
+            for px, py in self._build_body_part_points():
+                part_points.append([px / self.game_width, py / self.game_height])
+            self.config["body_part_points"] = part_points
+            cur_part = self.config.get("current_body_part", 1)
+            if (not isinstance(cur_part, int)) or cur_part < 1 or cur_part > 7:
+                self.config["current_body_part"] = 1
 
         self.config["calibration_done"][self.item_key] = True
         self.config_store.save()
+        if self._is_pull_new_experiment_scroll_item():
+            # 按需求：标定确认（回车/保存）后，延迟 1 秒重播一遍滚轮动作。
+            action = self.config.get("pull_new_experiment_scroll_action", {})
+            ax = action.get("x", 0.5)
+            ay = action.get("y", 0.5)
+            try:
+                distance = max(0.0, float(action.get("distance_down", action.get("distance", 0))))
+            except Exception:
+                distance = 0.0
+            # 先关闭标定层，避免覆盖鼠标坐标与滚轮回放。
+            if self.is_open():
+                self.win.withdraw()
+                self.win.update_idletasks()
+                self.win.update()
+            sleep(1.0)
+            abs_x = int(self.game_left + ax * self.game_width)
+            abs_y = int(self.game_top + ay * self.game_height)
+            pyautogui.moveTo(abs_x, abs_y)
+            # 新比例：1档=10滚轮单位，支持小数档位（如 8.5 -> 85 单位）。
+            total_units = max(0, int(round(distance * 10.0)))
+            full_steps = total_units // 10
+            remain_units = total_units % 10
+            for _ in range(full_steps):
+                pyautogui.scroll(-10)
+                # 提速 2 倍：每步滚动间隔由 10ms 降到 5ms。
+                sleep(0.005)
+            if remain_units > 0:
+                pyautogui.scroll(-remain_units)
         # 标定完成后不自动恢复，等待用户点“继续运行”再进入自动流程。
         self.state.calibration_updated = True
         self.state.manual_pause = True
@@ -324,11 +679,125 @@ class CalibrationOverlay:
         self.win = None
 
     def cancel(self):
-        self.state.manual_pause = False
+        # 不强制恢复 manual_pause：
+        # 原来无条件设 False 会导致用户在标定窗口按 ESC 后自动流程立即恢复，
+        # 现在只关闭窗口，由用户主动点"开始/继续"或按 F1 决定何时恢复。
         self.state.set_status("取消标定")
         if self.is_open():
             self.win.destroy()
         self.win = None
+
+
+class AllCalibrationOverlay:
+    """F12 调试叠加层：绘制所有标定框/点位。"""
+
+    def __init__(self, root, config_store, state, window_service):
+        self.root = root
+        self.config_store = config_store
+        self.state = state
+        self.window_service = window_service
+        self.win = None
+        self.canvas = None
+
+    @property
+    def config(self):
+        return self.config_store.data
+
+    def is_open(self):
+        return self.win is not None and self.win.winfo_exists()
+
+    def open(self):
+        if self.is_open():
+            return
+        left, top, width, height = self.window_service.get_window_region()
+        self.win = tk.Toplevel(self.root)
+        self.win.title("all-calibration-debug")
+        self.win.overrideredirect(True)
+        self.win.geometry(f"{width}x{height}+{left}+{top}")
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg=BG_APP)
+        # 提升 F12 调试叠加层可见度，避免边框/点位/文字过淡看不清。
+        self.win.attributes("-alpha", 0.48)
+        self.canvas = tk.Canvas(self.win, bg=BG_APP, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.redraw()
+
+    def close(self):
+        if self.is_open():
+            self.win.destroy()
+        self.win = None
+        self.canvas = None
+
+    def _draw_label_outside(self, target_rect, text, color):
+        """
+        将标签绘制在目标框外侧，避免遮挡边框/定位点。
+        优先放在目标上方；若空间不足则放在下方。
+        """
+        x1, y1, x2, y2 = target_rect
+        top_y = y1 - 24
+        if top_y >= 4:
+            tx, ty = x1, top_y
+        else:
+            tx = x1
+            ty = min(max(4, y2 + 8), self.win.winfo_height() - 24)
+        self.canvas.create_text(
+            tx + 1,
+            ty + 1,
+            anchor="nw",
+            text=text,
+            fill="#111827",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        self.canvas.create_text(
+            tx,
+            ty,
+            anchor="nw",
+            text=text,
+            fill=color,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+
+    def redraw(self):
+        if not self.is_open():
+            return
+        left, top, width, height = self.window_service.get_window_region()
+        self.win.geometry(f"{width}x{height}+{left}+{top}")
+        self.canvas.delete("all")
+        done_map = self.config.get("calibration_done", {})
+        rects = self.config.get("calibration_rects", {})
+        selected_keys = list(getattr(self.state, "calibration_overlay_selected_keys", []))
+        selected_set = set(selected_keys)
+        for key, label in CALIBRATION_ITEMS:
+            if selected_set and key not in selected_set:
+                continue
+            rect = rects.get(key)
+            if (not isinstance(rect, list)) or len(rect) != 4:
+                continue
+            x1 = int(rect[0] * width)
+            y1 = int(rect[1] * height)
+            x2 = int(rect[2] * width)
+            y2 = int(rect[3] * height)
+            color = "#22c55e" if bool(done_map.get(key, False)) else "#ef4444"
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=3)
+            self._draw_label_outside([x1, y1, x2, y2], label, color)
+        # 实验卡片点位（若存在）附加绘制
+        if (not selected_set) or ("experiment_switch" in selected_set):
+            exp_points = self.config.get("experiment_points", [])
+            for idx, p in enumerate(exp_points, start=1):
+                if isinstance(p, list) and len(p) == 2:
+                    px = int(p[0] * width)
+                    py = int(p[1] * height)
+                    self.canvas.create_oval(px - 4, py - 4, px + 4, py + 4, outline="#f59e0b", width=3)
+                    self.canvas.create_text(px + 8, py - 10, anchor="nw", text=str(idx), fill="#f59e0b")
+        # 身体部位点位（若存在）附加绘制
+        if (not selected_set) or ("body_part_switch" in selected_set):
+            part_points = self.config.get("body_part_points", [])
+            for idx, p in enumerate(part_points, start=1):
+                if isinstance(p, list) and len(p) == 2:
+                    px = int(p[0] * width)
+                    py = int(p[1] * height)
+                    self.canvas.create_oval(px - 4, py - 4, px + 4, py + 4, outline="#38bdf8", width=3)
+                    self.canvas.create_text(px + 8, py - 10, anchor="nw", text=str(idx), fill="#38bdf8")
 
 
 def launch_floating_window(config_store, state, window_service):
@@ -380,8 +849,12 @@ def launch_floating_window(config_store, state, window_service):
     status_line_var = tk.StringVar(value=f"流程: init  |  状态: {init_run_text}")
     like_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("like_enabled", True)))
     like_force_next_var = tk.BooleanVar(value=bool(config_store.data.get("like_force_next", False)))
+    experiment_switch_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("experiment_switch_enabled", False)))
     overlay_dx_var = tk.BooleanVar(value=bool(config_store.data.get("overlay_dx_hook_enabled", False)))
     overlay = CalibrationOverlay(root, config_store, state, window_service)
+    all_overlay = AllCalibrationOverlay(root, config_store, state, window_service)
+    selector_win = None
+    selector_vars = {}
     calib_buttons = {}
     label_map = {k: t for k, t in CALIBRATION_ITEMS}
     save_pos_after_id = None
@@ -510,6 +983,32 @@ def launch_floating_window(config_store, state, window_service):
         status_line_var.set(f"流程: {state.current_status}  |  状态: {run_var.get()}")
 
     def toggle_pause():
+        # 从“暂停->继续”前，先校验“实验切换”所需标定是否齐全。
+        # 这样可确保开启实验切换后，不会在缺少关键点位时误运行。
+        if state.manual_pause and experiment_switch_enabled_var.get():
+            missing = []
+            done_map = config_store.data.get("calibration_done", {})
+            required = [
+                ("experiment_selected_flag", "实验选定标志"),
+                ("recover_stamina_button", "恢复体力按钮"),
+                ("experiment_switch", "实验卡片"),
+                ("body_part_switch", "身体部位"),
+            ]
+            for key, label in required:
+                if not bool(done_map.get(key, False)):
+                    missing.append(label)
+
+            if len(config_store.data.get("experiment_points", [])) != 12 and "实验卡片" not in missing:
+                missing.append("实验卡片")
+            if len(config_store.data.get("body_part_points", [])) != 7 and "身体部位" not in missing:
+                missing.append("身体部位")
+
+            if missing:
+                state.manual_pause = True
+                state.set_status(f"实验切换缺少标定: {'、'.join(missing)}")
+                apply_pause_ui_text()
+                return
+
         state.manual_pause = not state.manual_pause
         if state.manual_pause:
             state.set_status("手动暂停")
@@ -521,13 +1020,83 @@ def launch_floating_window(config_store, state, window_service):
         apply_pause_ui_text()
 
     def on_exit():
+        nonlocal selector_win
         state.stop_requested = True
         if overlay.is_open():
             overlay.cancel()
+        if all_overlay.is_open():
+            all_overlay.close()
+        if selector_win is not None and selector_win.winfo_exists():
+            selector_win.destroy()
+            selector_win = None
         persist_window_pos()
         # 先 quit 再 destroy，确保 mainloop 干净退出。
         root.quit()
         root.destroy()
+
+    def close_selector_window(reset_phase=False):
+        nonlocal selector_win, selector_vars
+        if selector_win is not None and selector_win.winfo_exists():
+            selector_win.destroy()
+        selector_win = None
+        selector_vars = {}
+        state.open_calibration_overlay_selector = False
+        if reset_phase:
+            state.calibration_overlay_phase = "idle"
+            state.calibration_overlay_selected_keys = []
+
+    def open_selector_window():
+        nonlocal selector_win, selector_vars
+        if selector_win is not None and selector_win.winfo_exists():
+            selector_win.lift()
+            return
+
+        selector_vars = {}
+        selected_now = set(getattr(state, "calibration_overlay_selected_keys", []))
+        selector_win = tk.Toplevel(root)
+        selector_win.title("选择要显示的标定项")
+        selector_win.attributes("-topmost", True)
+        selector_win.configure(bg=BG_CARD)
+        selector_win.resizable(False, False)
+
+        card = tk.Frame(selector_win, bg=BG_CARD, padx=10, pady=10)
+        card.pack(fill="both", expand=True)
+        tk.Label(
+            card,
+            text="选择要显示的标定项（F12下一次按下将显示所选项）",
+            bg=BG_CARD,
+            fg=FG_MAIN,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        col_count = 3
+        for i, (key, label) in enumerate(CALIBRATION_ITEMS):
+            var = tk.BooleanVar(value=(key in selected_now))
+            selector_vars[key] = var
+            chk = ttk.Checkbutton(card, text=label, variable=var, style="Like.Big.TCheckbutton")
+            chk.grid(row=1 + (i // col_count), column=i % col_count, sticky="w", padx=4, pady=3)
+
+        btn_row = tk.Frame(card, bg=BG_CARD)
+        btn_row.grid(row=1 + (len(CALIBRATION_ITEMS) // col_count) + 1, column=0, columnspan=3, sticky="e", pady=(10, 0))
+
+        def on_confirm():
+            selected = [k for k, _ in CALIBRATION_ITEMS if selector_vars.get(k) and bool(selector_vars[k].get())]
+            state.calibration_overlay_selected_keys = selected
+            if selected:
+                state.calibration_overlay_phase = "ready_to_show"
+                print(f"\n[F12] 已选定 {len(selected)} 个标定项，再按一次 F12 显示。")
+            else:
+                state.calibration_overlay_phase = "idle"
+                print("\n[F12] 未选择任何标定项，已取消。")
+            close_selector_window(reset_phase=False)
+
+        def on_cancel():
+            close_selector_window(reset_phase=True)
+            print("\n[F12] 已取消标定项选择。")
+
+        tk.Button(btn_row, text="取消", command=on_cancel, bg=BTN_DANGER, fg="white", relief="flat").pack(side="right", padx=(6, 0))
+        tk.Button(btn_row, text="确定", command=on_confirm, bg=ACCENT, fg="white", relief="flat").pack(side="right")
+        selector_win.protocol("WM_DELETE_WINDOW", on_cancel)
 
     def toggle_submenu():
         cur_x = int(root.winfo_x())
@@ -698,6 +1267,20 @@ def launch_floating_window(config_store, state, window_service):
         # 点赞计数清零延后到“实际执行点赞后”再做，确保时序与业务一致。
         config_store.save()
 
+    def on_experiment_switch_toggle():
+        """
+        实验切换总开关：
+        - 仅负责记录用户意图；
+        - 具体“缺标定禁止运行”的硬约束由“继续运行”与后台流程共同兜底。
+        """
+        enabled = bool(experiment_switch_enabled_var.get())
+        config_store.data["experiment_switch_enabled"] = enabled
+        config_store.save()
+        if enabled:
+            state.set_status("已启用实验切换（需先完成实验相关标定）")
+        else:
+            state.set_status("已关闭实验切换")
+
     def on_overlay_dx_toggle():
         # 仅提供“用户可选”开关，便于后续接入 DX Hook/Overlay 实现。
         enabled = bool(overlay_dx_var.get())
@@ -835,6 +1418,15 @@ def launch_floating_window(config_store, state, window_service):
         cursor="hand2",
     )
     chk_like_enabled.pack(side="left", padx=(8, 4))
+    chk_experiment_switch = ttk.Checkbutton(
+        like_option_frame,
+        text="启用实验切换",
+        variable=experiment_switch_enabled_var,
+        command=on_experiment_switch_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_experiment_switch.pack(side="left", padx=(4, 4))
     chk_like_force = ttk.Checkbutton(
         like_option_frame,
         text="结束后执行点赞",
@@ -917,12 +1509,27 @@ def launch_floating_window(config_store, state, window_service):
         cfg_enabled = bool(config_store.data.get("like_enabled", True))
         if like_enabled_var.get() != cfg_enabled:
             like_enabled_var.set(cfg_enabled)
+        cfg_experiment_switch = bool(config_store.data.get("experiment_switch_enabled", False))
+        if experiment_switch_enabled_var.get() != cfg_experiment_switch:
+            experiment_switch_enabled_var.set(cfg_experiment_switch)
         cfg_overlay_dx = bool(config_store.data.get("overlay_dx_hook_enabled", False))
         if overlay_dx_var.get() != cfg_overlay_dx:
             overlay_dx_var.set(cfg_overlay_dx)
             apply_overlay_mode(force=True)
         refresh_like_force_state()
         refresh_button_colors()
+        if bool(getattr(state, "open_calibration_overlay_selector", False)):
+            open_selector_window()
+        elif selector_win is not None and selector_win.winfo_exists() and state.calibration_overlay_phase != "await_selection":
+            # 避免状态与窗口不一致（例如外部重置状态）时残留选择窗。
+            close_selector_window(reset_phase=False)
+        if bool(getattr(state, "show_all_calibration_overlay", False)):
+            if not all_overlay.is_open():
+                all_overlay.open()
+            all_overlay.redraw()
+        else:
+            if all_overlay.is_open():
+                all_overlay.close()
         if state.pending_calibration is not None:
             key = state.pending_calibration
             state.pending_calibration = None
