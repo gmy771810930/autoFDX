@@ -1,4 +1,7 @@
 numpy
 opencv-python
+# PyAutoGUI 截图依赖 pyscreeze + Pillow；不显式安装时，部分环境会报「无法导入 pyscreeze」。
+Pillow>=9.0.0
+pyscreeze>=0.1.28
 pyautogui
 keyboard

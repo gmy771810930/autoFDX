@@ -7,3 +7,5 @@ logs/
 data/user_config.json
 
 python-*.exe
+assets/templates/custom_experiment_selected_flag.png
+assets/templates/custom_bar_female.png

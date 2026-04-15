@@ -181,6 +181,18 @@ python fallen_doll.py
 
 - 目前按钮已加防抖，若仍异常可看日志并反馈触发路径。
 
+### 9.4 安装时提示 Scripts 不在 PATH / 标定报 PyAutoGUI 无法导入 pyscreeze？
+
+- **Scripts 不在 PATH**：常见于 `pip` 提示安装到了用户目录。只要用 `python -m pip ...` 或 `python fallen_doll.py` 启动，一般不影响使用；若新开终端仍找不到 `python`，请重启终端或勾选安装 Python 时的 **Add Python to PATH**，或重新运行 `setup_windows.bat`。
+- **无法导入 pyscreeze**（拼写为 `pyscreeze`，不是 pyscreez）：PyAutoGUI 截图依赖 **pyscreeze** 与 **Pillow**。请在项目根目录执行：
+  ```bash
+  python -m pip install -r tools/requirements.txt
+  ```
+  若仍失败可强制重装：
+  ```bash
+  python -m pip install --upgrade --force-reinstall pyscreeze Pillow pyautogui
+  ```
+
 ---
 
 ## 10. 使用建议

@@ -41,7 +41,7 @@ function Get-PythonCommand {
 
 try {
     Write-Host ""
-    Write-Step "[1/4] Checking Python..."
+    Write-Step "[1/5] Checking Python..."
     $pyCmd = Get-PythonCommand
 
     if (-not $pyCmd) {
@@ -71,7 +71,7 @@ try {
     }
 
     Write-Host ""
-    Write-Step "[2/4] Python detected:"
+    Write-Step "[2/5] Python detected:"
     Invoke-Expression "$pyCmd --version"
 
     if (-not (Test-Path "tools/requirements.txt")) {
@@ -79,17 +79,32 @@ try {
     }
 
     Write-Host ""
-    Write-Step "[3/4] Upgrading pip..."
+    Write-Step "[3/5] Upgrading pip..."
     Invoke-Expression "$pyCmd -m pip install --upgrade pip"
 
     Write-Host ""
-    Write-Step "[4/4] Installing dependencies from tools/requirements.txt..."
+    Write-Step "[4/5] Installing dependencies from tools/requirements.txt..."
     Invoke-Expression "$pyCmd -m pip install -r tools/requirements.txt"
+
+    Write-Host ""
+    Write-Step "[5/5] Verifying PyAutoGUI screenshot stack (pyscreeze / Pillow)..."
+    $verifyPy = "$pyCmd -c `"import pyscreeze; import PIL; import pyautogui; print('pyscreeze+Pillow+pyautogui OK')`""
+    Invoke-Expression $verifyPy
+    if ($LASTEXITCODE -ne 0) {
+        Write-WarnMsg "Import verification failed. Force-reinstalling screenshot-related packages..."
+        Invoke-Expression "$pyCmd -m pip install --upgrade --force-reinstall pyscreeze Pillow pyautogui"
+        Invoke-Expression $verifyPy
+        if ($LASTEXITCODE -ne 0) {
+            throw "Still cannot import pyscreeze/PIL/pyautogui. Try: python -m pip install -r tools/requirements.txt"
+        }
+    }
+    Write-Ok "Import verification passed."
 
     Write-Host ""
     Write-Ok "[DONE] Setup completed."
     Write-Info "You can now run:"
     Write-Host "  python fallen_doll.py" -ForegroundColor Green
+    Write-Info "Note: If pip printed 'Scripts is not on PATH', it is usually harmless when you run programs via 'python -m ...'."
     exit 0
 }
 catch {
