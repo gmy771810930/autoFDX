@@ -14,8 +14,11 @@ CALIBRATION_ITEMS = [
     ("cum2", "高潮按钮"),
     ("finish", "再来一次按钮"),
     ("experiment_selected_flag", "实验选定标志"),
+    ("recover_stamina_button", "恢复体力按钮"),
+    ("sensitive_progress_bar", "敏感进度条"),
+    ("special_action_button", "特殊动作按钮"),
+    ("pull_new_experiment_scroll", "拉出新实验滚动"),
     ("experiment_switch", "实验卡片"),
-    ("experiment_hex_switch", "实验分类"),
     ("body_part_switch", "身体部位"),
     ("bar_female", "女进度条"),
     ("bar_male", "男进度条"),
@@ -47,6 +50,9 @@ def build_default_config():
             "cum1": 0.95,
             "cum2": 0.95,
             "experiment_selected_flag": 0.95,
+            "recover_stamina_button": 0.95,
+            "sensitive_progress_bar": 0.95,
+            "special_action_button": 0.95,
         },
         "template_search_margin": 40,
         "template_regions": {},
@@ -62,15 +68,21 @@ def build_default_config():
         "safe_move_point": [0.95, 0.92],
         "ui_window_pos": [20, 20],
         "custom_templates": {},
+        # “拉出新实验滚动”动作标定结果：
+        # - x/y: 归一化鼠标坐标
+        # - distance_down: 向下滚动档位（支持小数，1档=10滚轮单位）
+        "pull_new_experiment_scroll_action": {
+            "x": 0.5,
+            "y": 0.5,
+            "distance_down": 0.0,
+        },
         "like_points": [],
         # 实验切换网格（3x4，共 12 点）：
         # - experiment_points: 按“从左到右、从上到下”顺序存储 12 个点（归一化坐标）。
         # - current_experiment: 当前实验索引，采用 [行, 列]（1-based）表示。
         "experiment_points": [],
         "current_experiment": [1, 1],
-        # 六边形实验切换网格（按行点数 6-6-6-1）：
-        # - experiment_hex_points: 按“从左到右、从上到下”保存中心点。
-        # - current_hex_experiment: 当前索引，仍用 [行, 列]（1-based）表示。
+        # 历史字段：六边形实验分类网格已废弃，保留空数据以兼容旧配置。
         "experiment_hex_points": [],
         "current_hex_experiment": [1, 1],
         # 身体部位入口（单行 7 点）：
@@ -92,10 +104,16 @@ def build_default_config():
             "finish": [0.55, 0.82, 0.65, 0.89],
             # 实验选定标志：和开始按钮同类，保存模板图与匹配区域。
             "experiment_selected_flag": [0.03, 0.02, 0.10, 0.12],
+            # 恢复体力按钮：模板匹配项，保存模板图与匹配区域。
+            "recover_stamina_button": [0.82, 0.82, 0.96, 0.94],
+            # 敏感进度条：用于检测红色占比变化。
+            "sensitive_progress_bar": [0.40, 0.80, 0.72, 0.90],
+            # 特殊动作按钮：用于检测红色占比并执行点击。
+            "special_action_button": [0.74, 0.78, 0.92, 0.92],
+            # 拉出新实验滚动：以“点位模式”标定，默认放在中心。
+            "pull_new_experiment_scroll": [0.50, 0.50, 0.50, 0.50],
             # 实验切换联合标定网的默认包围框（行列均匀分布由 UI 侧计算）。
             "experiment_switch": [0.30, 0.25, 0.70, 0.55],
-            # 六边形网格标定默认包围框（6-6-6-1 中心点由 UI 侧计算）。
-            "experiment_hex_switch": [0.08, 0.10, 0.92, 0.90],
             # 身体部位标定默认包围框（单行 7 点中心由 UI 侧计算）。
             "body_part_switch": [0.10, 0.10, 0.92, 0.24],
             "bar_female": [0.07, 0.75, 0.18, 0.79],
@@ -173,6 +191,9 @@ class ConfigStore:
         # 清理已废弃的旧标定项，避免后续维护混淆。
         self.data["calibration_done"].pop("bar_area", None)
         self.data["calibration_rects"].pop("bar_area", None)
+        # 实验分类（六边形网格）标定已移除。
+        self.data["calibration_done"].pop("experiment_hex_switch", None)
+        self.data["calibration_rects"].pop("experiment_hex_switch", None)
         # 清理已废弃点赞重复配置：点赞流程已改为固定节奏，不再使用该字段。
         self.data.pop("like_click_repeat", None)
         # 点赞开关与“下一次立即点赞”标记补默认值。
@@ -189,6 +210,28 @@ class ConfigStore:
         # 身体部位：补齐当前索引与中心点网格数据。
         self.data.setdefault("current_body_part", 1)
         self.data.setdefault("body_part_points", [])
+        # 拉出新实验滚动动作：补齐默认动作结构。
+        self.data.setdefault(
+            "pull_new_experiment_scroll_action",
+            {"x": 0.5, "y": 0.5, "distance_down": 0.0},
+        )
+        # 兼容旧版本字段：direction/distance -> distance_down。
+        action = self.data.get("pull_new_experiment_scroll_action", {})
+        if isinstance(action, dict):
+            if "distance_down" not in action:
+                try:
+                    old_distance = float(action.get("distance", 0))
+                except Exception:
+                    old_distance = 0.0
+                action["distance_down"] = max(0.0, old_distance)
+            else:
+                try:
+                    action["distance_down"] = max(0.0, float(action.get("distance_down", 0)))
+                except Exception:
+                    action["distance_down"] = 0.0
+            action.pop("direction", None)
+            action.pop("distance", None)
+            self.data["pull_new_experiment_scroll_action"] = action
         # DX Hook/Overlay 选择项补默认值。
         self.data.setdefault("overlay_dx_hook_enabled", False)
 

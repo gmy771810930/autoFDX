@@ -1,5 +1,84 @@
-import pyautogui
+import ctypes
+import sys
+from ctypes import wintypes
 from time import monotonic, sleep
+
+import cv2
+import keyboard
+import numpy as np
+import pyautogui
+
+# ---------------------------------------------------------------------------
+# SendInput 底层鼠标移动（仅 Windows）
+# 结构体布局必须与 WinUser.h 一致，否则 SendInput 返回 0。
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    _ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
+
+    _INPUT_MOUSE = 0
+    _MOUSEEVENTF_MOVE = 0x0001
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = (
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", _ULONG_PTR),
+        )
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = (
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", _ULONG_PTR),
+        )
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = (
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        )
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = (
+            ("mi", _MOUSEINPUT),
+            ("ki", _KEYBDINPUT),
+            ("hi", _HARDWAREINPUT),
+        )
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = (
+            ("type", wintypes.DWORD),
+            ("u", _INPUT_UNION),
+        )
+
+    _INPUT_SIZE = ctypes.sizeof(_INPUT)
+    _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+    _user32.SendInput.restype = wintypes.UINT
+
+    def _send_relative_move(dx: int, dy: int) -> bool:
+        """通过 SendInput 注入一次相对鼠标移动事件。"""
+        inp = _INPUT()
+        inp.type = _INPUT_MOUSE
+        inp.u.mi = _MOUSEINPUT(int(dx), int(dy), 0, _MOUSEEVENTF_MOVE, 0, _ULONG_PTR(0))
+        sent = _user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
+        if sent != 1:
+            err = ctypes.get_last_error()
+            print(f"[SendInput] 失败 sent={sent}, GetLastError={err}")
+            return False
+        return True
+else:
+    def _send_relative_move(dx: int, dy: int) -> bool:
+        """非 Windows 回退：用 pyautogui 模拟。"""
+        pyautogui.moveRel(dx, dy)
+        return True
 
 
 class GameActions:
@@ -133,14 +212,6 @@ class GameActions:
         pyautogui.press("e")
         sleep(0.12)
 
-    def click_experiment_category(self, index_1based):
-        """
-        点击“实验分类”网格点（6-6-6-1，共 19 点）。
-        index_1based 为 1-based 索引。
-        """
-        point = self._point_by_1based_index(self.config.get("experiment_hex_points", []), index_1based)
-        return self._click_point(point)
-
     def click_body_part(self, index_1based):
         """
         点击“身体部位”网格点（单行 7 点）。
@@ -181,9 +252,7 @@ class GameActions:
         在给定超时时间内轮询“开始按钮”是否出现。
         返回 True 表示出现；False 表示超时未出现。
         """
-        # 统一下限到 1 秒：
-        # 你要求“至少 500ms，若原本已是 500ms 则提高到 1s”，
-        # 因此这里直接强制最短等待窗口为 1s。
+        # 最短等待窗口不低于 1s；实验部署阶段可传入更长超时（由上层决定）。
         timeout = max(1.0, float(timeout_sec))
         deadline = monotonic() + timeout
         while monotonic() < deadline:
@@ -192,17 +261,257 @@ class GameActions:
             sleep(max(0.01, float(poll_interval_sec)))
         return False
 
-    def deploy_experiment_with_retry(self, wait_start_sec=1.0):
+    def move_camera_right_sendinput(self):
+        """
+        流程.md 第5条【移动视角部署】：
+        使用 SendInput 底层输入让鼠标向右移动屏幕横向分辨率 1/10 的距离。
+        分多小步执行以提高游戏对输入事件的识别率。
+        """
+        screen_w, _ = pyautogui.size()
+        total_dx = screen_w // 10
+        step_px = 80
+        steps = total_dx // step_px
+        remainder = total_dx % step_px
+        for _ in range(steps):
+            _send_relative_move(step_px, 0)
+            sleep(0.02)
+        if remainder > 0:
+            _send_relative_move(remainder, 0)
+        # 移动完成后短暂稳定，避免游戏来不及响应
+        sleep(0.1)
+        print(f"\n[移动视角] SendInput 向右移动 {total_dx}px（屏幕宽 {screen_w} 的 1/10）。")
+
+    def has_recover_stamina_button(self, timeout_sec=2.0, poll_interval_sec=0.06):
+        """
+        检测“恢复体力按钮”是否出现（模板匹配）：
+        - 与 start/finish 同类，依赖标定后的模板图与匹配区域；
+        - 在 timeout_sec 内轮询，任意一次命中即返回 True。
+        """
+        deadline = monotonic() + max(0.1, float(timeout_sec))
+        while monotonic() < deadline:
+            if self.vision_service.match("recover_stamina_button") is not None:
+                print("\n[恢复体力按钮检测] 检测到恢复体力按钮。")
+                return True
+            sleep(max(0.01, float(poll_interval_sec)))
+        print("\n[恢复体力按钮检测] 超时未检测到恢复体力按钮。")
+        return False
+
+    def deploy_and_check_start_recover(self, timeout_sec=2.0, poll_interval_sec=0.06):
+        """
+        尝试部署并在同一时间窗口内同时检测“开始按钮 + 恢复体力按钮”：
+        - 先左键尝试部署；
+        - 在 timeout_sec 内循环判断：
+          1) 若两者同时存在 -> (start_seen=True, both_ready=True)
+          2) 若只出现过开始按钮 -> (start_seen=True, both_ready=False)
+          3) 若开始按钮始终未出现 -> (start_seen=False, both_ready=False)
+        """
+        ws = max(1.0, float(timeout_sec))
+        print(f"\n[部署实验] 左键尝试部署，并在 {ws:.1f}s 内同时检测开始按钮+恢复体力按钮...")
+        pyautogui.leftClick()
+        deadline = monotonic() + ws
+        start_seen = False
+        while monotonic() < deadline:
+            has_start = bool(self.ready_to_start())
+            has_recover = self.vision_service.match("recover_stamina_button") is not None
+            if has_start:
+                start_seen = True
+            if has_start and has_recover:
+                print("\n[部署实验] 成功：开始按钮与恢复体力按钮均检测到。")
+                return True, True
+            sleep(max(0.01, float(poll_interval_sec)))
+
+        if start_seen:
+            print(f"\n[部署实验] 失败：{ws:.1f}s 内出现过开始按钮，但恢复体力按钮未出现。")
+            return True, False
+        print(f"\n[部署实验] 失败：{ws:.1f}s 内未出现开始按钮。")
+        return False, False
+
+    def _capture_calibration_region_bgr(self, key):
+        """
+        读取某标定项区域截图（BGR）：
+        - 只使用 calibration_rects 中的归一化坐标；
+        - 未标定或区域非法时返回 None，调用方需做降级处理。
+        """
+        done_map = self.config.get("calibration_done", {})
+        if not bool(done_map.get(key, False)):
+            return None
+        rect_map = self.config.get("calibration_rects", {})
+        norm = rect_map.get(key)
+        if (not isinstance(norm, list)) or len(norm) != 4:
+            return None
+        x1, y1, x2, y2 = self.window_service.denormalize_region(norm)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        shot = pyautogui.screenshot(region=(x1, y1, x2 - x1, y2 - y1))
+        return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+
+    def _build_red_mask(self, bgr_img):
+        """
+        构建红色掩码（HSV 双区间）：
+        红色跨越色相 0/179，需要合并两个区间。
+        """
+        if bgr_img is None or bgr_img.size == 0:
+            return None
+        hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+        # 适当放宽 S/V 下限，提升对游戏内半透明与抗锯齿边缘的覆盖。
+        mask1 = cv2.inRange(hsv, np.array([0, 55, 50]), np.array([12, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([168, 55, 50]), np.array([179, 255, 255]))
+        return cv2.bitwise_or(mask1, mask2)
+
+    def _red_ratio(self, bgr_img):
+        """
+        计算图像中“红色像素占比”：
+        - 使用 HSV 双区间（低 H + 高 H）覆盖红色环绕；
+        - 返回 [0,1] 比例，便于做阈值判断。
+        """
+        mask = self._build_red_mask(bgr_img)
+        if mask is None:
+            return 0.0
+        return float(np.count_nonzero(mask)) / float(mask.size)
+
+    def _red_fill_ratio(self, bgr_img):
+        """
+        估计“红色填充占比”（比纯面积占比更稳）：
+        - 先做开闭运算去噪并连接断裂；
+        - 结合 area_ratio 与 length_ratio（从左到右的活跃列长度）得到分数。
+        """
+        mask = self._build_red_mask(bgr_img)
+        if mask is None:
+            return 0.0
+        area_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        bin_mask = (mask > 0).astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
+        clean = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN, kernel)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
+        col_ratio = np.mean(clean, axis=0)
+        active_cols = np.where(col_ratio > 0.22)[0]
+        if active_cols.size == 0:
+            return float(np.clip(area_ratio * 0.5, 0.0, 1.0))
+        rightmost = int(active_cols.max())
+        length_ratio = float(rightmost + 1) / float(clean.shape[1])
+        score = 0.72 * length_ratio + 0.28 * area_ratio
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _build_blue_mask(self, bgr_img):
+        """
+        构建蓝色掩码（HSV）：
+        用于“敏感进度条”为蓝色时的占比检测。
+        """
+        if bgr_img is None or bgr_img.size == 0:
+            return None
+        hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+        # 蓝色大致在 H=[95,135]，S/V 放宽以覆盖游戏内抗锯齿和半透明边缘。
+        return cv2.inRange(hsv, np.array([95, 55, 50]), np.array([135, 255, 255]))
+
+    def _blue_fill_ratio(self, bgr_img):
+        """
+        估计“蓝色填充占比”（与红色同口径）：
+        - 开闭运算去噪并连接断裂；
+        - 融合面积占比与从左到右长度占比。
+        """
+        mask = self._build_blue_mask(bgr_img)
+        if mask is None:
+            return 0.0
+        area_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        bin_mask = (mask > 0).astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
+        clean = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN, kernel)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
+        col_ratio = np.mean(clean, axis=0)
+        active_cols = np.where(col_ratio > 0.22)[0]
+        if active_cols.size == 0:
+            return float(np.clip(area_ratio * 0.5, 0.0, 1.0))
+        rightmost = int(active_cols.max())
+        length_ratio = float(rightmost + 1) / float(clean.shape[1])
+        score = 0.72 * length_ratio + 0.28 * area_ratio
+        return float(np.clip(score, 0.0, 1.0))
+
+    def get_sensitive_progress_bar_ratio(self):
+        """返回“敏感进度条”填充占比；未标定时返回 None。"""
+        crop = self._capture_calibration_region_bgr("sensitive_progress_bar")
+        if crop is None:
+            return None
+        # 按最新规则：敏感进度条颜色为蓝色。
+        return self._blue_fill_ratio(crop)
+
+    def is_special_action_button_red(self, threshold=0.60):
+        """判断“特殊动作按钮”是否进入红色态（红色占比 >= threshold）。"""
+        crop = self._capture_calibration_region_bgr("special_action_button")
+        if crop is None:
+            return False
+        ratio = self._red_ratio(crop)
+        return ratio >= float(threshold)
+
+    def press_main_keyboard_one_after_delay(self, delay_sec=0.5):
+        """
+        延迟后触发主键盘“1”（非小键盘）：
+        - 使用 keyboard.press_and_release("1")；
+        - 用于替代“点击特殊动作按钮中心”的旧逻辑。
+        """
+        sleep(max(0.0, float(delay_sec)))
+        try:
+            keyboard.press_and_release("1")
+            print("\n[特殊动作] 已触发主键盘“1”。")
+            return True
+        except Exception as exc:
+            print(f"\n[特殊动作] 触发主键盘“1”失败：{exc}")
+            return False
+
+    def replay_pull_new_experiment_scroll_action(self, delay_sec=1.0):
+        """
+        重播“拉出新实验滚动”标定动作：
+        - 延迟 delay_sec 后执行；
+        - 在标定记录的坐标处，向下滚动记录距离。
+        """
+        action = self.config.get("pull_new_experiment_scroll_action", {})
+        ax = action.get("x", 0.5)
+        ay = action.get("y", 0.5)
+        # 兼容旧数据：若无 distance_down，则回退读取旧 distance。
+        raw_distance = action.get("distance_down", action.get("distance", 0))
+        try:
+            distance = max(0.0, float(raw_distance))
+        except Exception:
+            distance = 0.0
+        if distance <= 0.0:
+            print("\n[拉出新实验滚动] 重播跳过：向下滚动距离为0，请先完成该标定。")
+            return False
+        try:
+            sleep(max(0.0, float(delay_sec)))
+            x, y = self.window_service.denormalize_point([ax, ay])
+            pyautogui.moveTo(x, y)
+            # 按需求固定“向下滚动”。
+            # 新比例：1档=10滚轮单位，支持小数档位（如 8.5 -> 85 单位）。
+            total_units = max(0, int(round(distance * 10.0)))
+            full_steps = total_units // 10
+            remain_units = total_units % 10
+            for _ in range(full_steps):
+                pyautogui.scroll(-10)
+                # 提速 2 倍：每步滚动间隔由 10ms 降到 5ms。
+                sleep(0.005)
+            if remain_units > 0:
+                pyautogui.scroll(-remain_units)
+            print(
+                f"\n[拉出新实验滚动] 已重播：x={ax:.3f}, y={ay:.3f}, "
+                f"direction=down, distance_down={distance:g}"
+            )
+            return True
+        except Exception as exc:
+            print(f"\n[拉出新实验滚动] 重播失败：{exc}")
+            return False
+
+    def deploy_experiment_with_retry(self, wait_start_sec=2.0):
         """
         尝试部署实验（对齐流程.md 第4条）：
-        左键点击一次，1s 内出现开始按鈕 → 成功；否则直接切换下一个实验（上层处理）。
+        左键点击一次，在 wait_start_sec 内出现开始按钮 → 成功；否则由上层切换下一实验。
+        女进度条存在检查由上层（automation.py）负责。
         """
-        print("\n[部署实验] 左键尝试部署，等待开始按鈕...")
+        ws = max(1.0, float(wait_start_sec))
+        print(f"\n[部署实验] 左键尝试部署，等待开始按钮（最长 {ws:.1f}s）...")
         pyautogui.leftClick()
-        if self.wait_start_button(timeout_sec=wait_start_sec):
-            print("\n[部署实验] 成功：检测到开始按鈕。")
+        if self.wait_start_button(timeout_sec=ws):
+            print("\n[部署实验] 成功：检测到开始按钮。")
             return True
-        print("\n[部署实验] 失败：1s 内未出现开始按鈕，切换下一个实验。")
+        print(f"\n[部署实验] 失败：{ws:.1f}s 内未出现开始按钮，切换下一个实验。")
         return False
 
     def _click_with_interval(self, x, y, count, interval_sec):
