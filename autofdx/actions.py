@@ -97,6 +97,59 @@ class GameActions:
     def wait(self, sec):
         sleep(sec / 2)
 
+    def _wait_template_disappear(
+        self,
+        template_name,
+        timeout_sec=0.55,
+        poll_interval_sec=0.05,
+        stable_miss_required=3,
+        settle_delay_sec=0.06,
+    ):
+        """
+        轮询等待模板消失（去抖成功判定）：
+        - 点击后不立即认定成功，必须观察到按钮模板“消失”才算本次点击有效；
+        - 为避免“单帧丢匹配”导致误判，会要求连续多次检测不到模板才判定成功；
+        - 若在超时窗口内仍能匹配到模板，则视为本次点击失败（需要重试）。
+        """
+        # 点击后先给 UI 一个最小稳定时间，再做“消失”判断，降低过早采样误判。
+        sleep(max(0.0, float(settle_delay_sec)))
+        deadline = monotonic() + max(0.1, float(timeout_sec))
+        miss_count = 0
+        miss_need = max(1, int(stable_miss_required))
+        while monotonic() < deadline:
+            # 必须“连续 miss”达到阈值，才算成功消失。
+            if self.vision_service.match(template_name) is None:
+                miss_count += 1
+                if miss_count >= miss_need:
+                    return True
+            else:
+                miss_count = 0
+            sleep(max(0.01, float(poll_interval_sec)))
+        return False
+
+    def _click_with_disappear_retry(
+        self,
+        template_name,
+        click_fn,
+        max_retry=4,
+        retry_interval_sec=0.16,
+        disappear_timeout_sec=0.45,
+    ):
+        """
+        通用“点击 + 去抖重试”流程：
+        1) 执行一次点击动作；
+        2) 仅当按钮模板在短时间内消失，才认定点击成功；
+        3) 若未消失，则等待一小段时间后重试。
+        """
+        retries = max(1, int(max_retry))
+        for _ in range(retries):
+            click_fn()
+            if self._wait_template_disappear(template_name, timeout_sec=disappear_timeout_sec):
+                return True
+            # 未消失则判定为点击未生效，短暂等待后再次尝试。
+            sleep(max(0.05, float(retry_interval_sec)))
+        return False
+
     def ready_to_start(self):
         return self.vision_service.match("start")
 
@@ -143,8 +196,11 @@ class GameActions:
         sleep(0.15)
 
     def start(self):
-        pos = self.vision_service.match("start")
-        if pos:
+        def _click_once():
+            # 每次重试都重新取当前模板中心，避免首次坐标过期导致“越点越偏”。
+            pos = self.vision_service.match("start")
+            if not pos:
+                return
             pyautogui.moveTo(pos[0], pos[1])
             self.wait(0.12)
             pyautogui.leftClick()
@@ -153,10 +209,16 @@ class GameActions:
             self.wait(0.08)
             self._move_mouse_right_after_click("start")
 
+        return self._click_with_disappear_retry("start", _click_once)
+
     def cum(self):
         key = f"cum{self.state.cum_mode}"
-        pos = self.vision_service.match(key)
-        if pos:
+
+        def _click_once():
+            # 每次重试动态取点，兼容按钮动画抖动/轻微位移。
+            pos = self.vision_service.match(key)
+            if not pos:
+                return
             pyautogui.moveTo(pos[0], pos[1])
             self.wait(0.12)
             # 略微拉开双击间隔，降低与游戏输入竞争导致的漏触发。
@@ -164,9 +226,14 @@ class GameActions:
             self.wait(0.08)
             self._move_mouse_right_after_click(key)
 
+        return self._click_with_disappear_retry(key, _click_once)
+
     def finish(self):
-        pos = self.vision_service.match("finish")
-        if pos:
+        def _click_once():
+            # 每次重试动态取点，避免使用陈旧坐标。
+            pos = self.vision_service.match("finish")
+            if not pos:
+                return
             pyautogui.moveTo(pos[0], pos[1])
             self.wait(0.12)
             pyautogui.leftClick()
@@ -174,6 +241,8 @@ class GameActions:
             pyautogui.leftClick()
             self.wait(0.08)
             self._move_mouse_right_after_click("finish")
+
+        return self._click_with_disappear_retry("finish", _click_once)
 
     def move_to_scroll_region_center(self):
         r = self.config["scroll_region"]
@@ -442,13 +511,22 @@ class GameActions:
         ratio = self._red_ratio(crop)
         return ratio >= float(threshold)
 
-    def press_main_keyboard_one_after_delay(self, delay_sec=0.5):
+    def press_main_keyboard_one_after_delay(self, delay_sec=0.5, abort_check=None):
         """
         延迟后触发主键盘“1”（非小键盘）：
         - 使用 keyboard.press_and_release("1")；
         - 用于替代“点击特殊动作按钮中心”的旧逻辑。
+        - abort_check：可选，返回 True 表示应取消本次按键（阶段已结束/已暂停等）。
+          延迟期间分段睡眠并轮询，避免固定 sleep 结束后再退出导致误触。
         """
-        sleep(max(0.0, float(delay_sec)))
+        total = max(0.0, float(delay_sec))
+        deadline = monotonic() + total
+        while monotonic() < deadline:
+            if abort_check and abort_check():
+                return False
+            sleep(0.02)
+        if abort_check and abort_check():
+            return False
         try:
             keyboard.press_and_release("1")
             print("\n[特殊动作] 已触发主键盘“1”。")

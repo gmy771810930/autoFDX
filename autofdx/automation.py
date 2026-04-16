@@ -5,6 +5,22 @@ import keyboard
 import pyautogui
 
 
+def _sleep_interruptible(total_sec, state, step_sec=0.05):
+    """
+    可中断睡眠：在关闭程序时尽快跳出，避免长时间 sleep 阻塞 run_forever 退出。
+    """
+    total = max(0.0, float(total_sec))
+    step = max(0.01, float(step_sec))
+    deadline = time() + total
+    while time() < deadline:
+        if state.stop_requested:
+            return
+        remain = deadline - time()
+        if remain <= 0:
+            break
+        sleep(min(step, remain))
+
+
 class AutomationEngine:
     """自动流程主循环。"""
 
@@ -16,6 +32,7 @@ class AutomationEngine:
         self.actions = actions
         self._f1_hotkey_handle = None
         self._f2_hotkey_handle = None
+        self._f3_hotkey_handle = None
         self._f11_hotkey_handle = None
         self._f12_hotkey_handle = None
         # 滚轮副线程控制状态：
@@ -56,23 +73,55 @@ class AutomationEngine:
         self._female_bar_monitor_thread = None
         # 女进度条停滞检测“可恢复最早时间戳”（秒）：
         # - 正常开局时：用于“点击开始后延时3秒再允许停滞判断”；
-        # - 特殊动作后：在“敏感进度条先明显增长”之后，才会把该值设为“当前+3秒”。
+        # - 特殊动作后：在“特殊动作按键重新出现”后，再把该值设为“当前+3秒”。
         self._female_bar_stall_suspend_until = 0.0
         # 特殊动作恢复状态：
-        # True 表示“已触发主键盘1，正在等待敏感进度条先明显增长，再额外延迟3秒恢复停滞判断”。
-        self._female_bar_stall_wait_increase = False
-        self._female_bar_stall_resume_baseline = None
+        # True 表示“已触发主键盘1，正在等待特殊动作按键重新出现”。
+        self._female_bar_stall_wait_special_reappear = False
+        # 该标记用于确保“重新出现”语义成立：
+        # 必须先检测到按键消失，再检测到按键出现，才允许进入3秒恢复倒计时。
+        self._female_bar_stall_special_hidden_once = False
         # 特殊动作状态机（按新规则）：
         # - 当“敏感进度条<60% 且 特殊动作按钮红色>60%”时，延迟 500ms 触发主键盘“1”；
-        # - 每次触发后，女进度条停滞检测暂停 3s，再自动恢复判断。
+        # - 每次触发后，先暂停女进度条停滞检测；
+        #   等“特殊动作按键”重新出现后，再延迟 3s 自动恢复判断。
         # 连续触发节流时间戳：避免条件持续满足时每帧都触发按键。
         self._special_action_last_trigger_ts = 0.0
         self._special_action_monitor_active = False
         self._special_action_monitor_stop = threading.Event()
         self._special_action_monitor_thread = None
+        # 特殊动作阶段令牌：主线程进入/离开「开始~高潮」区间时更新，防止子线程在
+        # press 的 0.5s 延迟后仍发送「1」（阶段已结束或已暂停时偶发误触）。
+        self._special_action_phase_token = 0
+        self._special_action_expected_token = 0
         # 降低 pyautogui 全局动作间隔，避免滚轮动作被库默认节流。
         # 调整为 0：进一步提升连续滚轮吞吐，解决“滚动距离/次数偏小”的问题。
         pyautogui.PAUSE = 0
+        # PyAutoGUI 默认 failsafe：光标停在屏幕四角时，下一次任意操作会抛异常以防失控。
+        # 本脚本会把鼠标移到窗口边角安全位（如 safe_move_point）、全屏/无边框下也易贴近物理屏幕角，
+        # 与用户手操或特殊动作恢复流程叠加时易误触，导致主循环异常中断（例如特殊动作日志刚打印后崩溃）。
+        # 自动化场景关闭 failsafe；紧急停止仍依赖 F1 暂停与悬浮窗「退出脚本」。
+        pyautogui.FAILSAFE = False
+
+    def _special_action_should_abort(self):
+        """
+        若应放弃本次「按 1」，返回 True（用于延迟等待期间与按键前二次校验）。
+        覆盖：已暂停、已请求停止/标定、阶段已结束、高潮按钮已出现（主循环即将退出）。
+        """
+        if not self._special_action_monitor_active:
+            return True
+        if self._special_action_phase_token != self._special_action_expected_token:
+            return True
+        if self.state.manual_pause:
+            return True
+        if self.state.stop_requested or self.state.pending_calibration is not None:
+            return True
+        try:
+            if self.actions.ready_to_cum():
+                return True
+        except Exception:
+            return True
+        return False
 
     def _read_card_index_from_config(self):
         """
@@ -437,6 +486,32 @@ class AutomationEngine:
         self.state.set_status("F2已暂停，恢复后切换下一实验")
         print("\n[F2] 已暂停，恢复后将立即切换下一实验。")
 
+    def _toggle_like_force_next_by_f3(self):
+        """
+        F3 快捷操作：
+        - 切换“结束后执行点赞（一次性）”开关；
+        - 与 UI 勾选保持同一配置项（like_force_next）。
+        """
+        like_enabled = bool(self.config_store.data.get("like_enabled", True))
+        if not like_enabled:
+            # 点赞功能关闭时，不允许置位“结束后执行点赞”，避免出现看不见的无效状态。
+            if bool(self.config_store.data.get("like_force_next", False)):
+                self.config_store.data["like_force_next"] = False
+                self.config_store.save()
+            self.state.set_status("F3忽略：点赞功能未开启")
+            print("\n[F3] 已忽略：当前未开启点赞功能。")
+            return
+
+        next_value = not bool(self.config_store.data.get("like_force_next", False))
+        self.config_store.data["like_force_next"] = next_value
+        self.config_store.save()
+        if next_value:
+            self.state.set_status("F3已开启：结束后执行点赞")
+            print("\n[F3] 已开启：结束后执行点赞（一次性）。")
+        else:
+            self.state.set_status("F3已关闭：结束后执行点赞")
+            print("\n[F3] 已关闭：结束后执行点赞。")
+
     def _toggle_all_calibration_overlay_by_f12(self):
         """
         F12 调试三段式流程：
@@ -530,9 +605,10 @@ class AutomationEngine:
                 baseline_time = None
                 sleep(0.1)
                 continue
-            # 额外条件：特殊动作触发后暂停停滞判断，3s 后自动恢复。
+            # 额外条件：特殊动作触发后暂停停滞判断；
+            # 直到“特殊动作按键重新出现 + 延时3秒”后才恢复。
             now = time()
-            if now < self._female_bar_stall_suspend_until or self._female_bar_stall_wait_increase:
+            if now < self._female_bar_stall_suspend_until or self._female_bar_stall_wait_special_reappear:
                 baseline_b1 = None
                 baseline_time = None
                 sleep(0.1)
@@ -591,41 +667,50 @@ class AutomationEngine:
                 continue
 
             # 恢复顺序（按需求）：
-            # 1) 先等待“敏感进度条明显增长”（相对触发“1”时基线 +0.02）；
-            # 2) 增长达成后，再额外延迟 3 秒；
+            # 1) 按下“1”后，先等待特殊动作按键“消失 -> 重新出现”；
+            # 2) 重新出现后，再额外延迟 3 秒；
             # 3) 最后恢复女进度条停滞判断。
-            if self._female_bar_stall_wait_increase:
-                if (
-                    self._female_bar_stall_resume_baseline is not None
-                    and sensitive_ratio >= self._female_bar_stall_resume_baseline + 0.02
-                ):
-                    # 第一次检测到“明显增长”时，启动恢复倒计时 3 秒。
-                    if self._female_bar_stall_suspend_until <= 0.0:
-                        self._female_bar_stall_suspend_until = time() + 3.0
-                        print("\n[特殊动作] 敏感进度条已明显增长，开始延时3秒后恢复女进度条停滞判断。")
-                    elif time() >= self._female_bar_stall_suspend_until:
-                        self._female_bar_stall_wait_increase = False
-                        self._female_bar_stall_resume_baseline = None
-                        self._female_bar_stall_suspend_until = 0.0
-                        print("\n[特殊动作] 已完成“增长后延时3秒”，恢复女进度条停滞判断。")
+            if self._female_bar_stall_wait_special_reappear:
+                if self._special_action_should_abort():
+                    sleep(0.1)
+                    continue
+                # “按键重新出现”用红色占比做可见性近似判断：
+                # 阈值取 0.20（低于触发阈值 0.60），尽量放宽“出现”识别，降低误漏检。
+                button_visible = self.actions.is_special_action_button_red(threshold=0.20)
+                if not self._female_bar_stall_special_hidden_once:
+                    # 第一步：等待按键先消失，确保后续“出现”是“重新出现”而非持续可见。
+                    if not button_visible:
+                        self._female_bar_stall_special_hidden_once = True
+                        print("\n[特殊动作] 检测到按键已消失，继续等待按键重新出现。")
+                elif button_visible:
+                    # 第二步：检测到重新出现后，启动 3 秒恢复倒计时并解除“等待重新出现”状态。
+                    self._female_bar_stall_wait_special_reappear = False
+                    self._female_bar_stall_special_hidden_once = False
+                    self._female_bar_stall_suspend_until = time() + 3.0
+                    print("\n[特殊动作] 检测到按键重新出现，开始延时3秒后恢复女进度条停滞判断。")
 
             # 条件：敏感进度条<60% 且 特殊动作按钮红色占比>60%。
             # 与点击逻辑保持“循环判断”，条件持续满足时可重复触发“1”。
             if sensitive_ratio < 0.60 and self.actions.is_special_action_button_red(threshold=0.60):
+                if self._special_action_should_abort():
+                    sleep(0.1)
+                    continue
                 # 触发节流：最多约每 0.8s 触发一次，避免按键洪泛。
                 now_ts = time()
                 if (now_ts - self._special_action_last_trigger_ts) >= 0.8:
-                    if self.actions.press_main_keyboard_one_after_delay(delay_sec=0.5):
+                    if self.actions.press_main_keyboard_one_after_delay(
+                        delay_sec=0.5, abort_check=self._special_action_should_abort
+                    ):
                         self._special_action_last_trigger_ts = now_ts
-                        # 每次触发“1”后，先等待敏感进度条明显增长，
+                        # 每次触发“1”后，先暂停停滞检测并等待“特殊动作按键重新出现”，
                         # 再额外延迟3秒，最后恢复女进度条停滞检测。
                         self._female_bar_stall_flag = False
                         self._female_bar_stall_suspend_until = 0.0
-                        self._female_bar_stall_wait_increase = True
-                        self._female_bar_stall_resume_baseline = sensitive_ratio
+                        self._female_bar_stall_wait_special_reappear = True
+                        self._female_bar_stall_special_hidden_once = False
                         print(
                             f"\n[特殊动作] 已触发“1”：敏感进度条={sensitive_ratio:.3f}，"
-                            "等待敏感进度条明显增长后再延时3秒恢复停滞判断。"
+                            "暂停女进度条停滞检测，等待特殊动作按键重新出现后再延时3秒恢复。"
                         )
             sleep(0.1)
 
@@ -636,8 +721,8 @@ class AutomationEngine:
             self._special_action_monitor_active = False
             self._special_action_last_trigger_ts = 0.0
             self._female_bar_stall_suspend_until = 0.0
-            self._female_bar_stall_wait_increase = False
-            self._female_bar_stall_resume_baseline = None
+            self._female_bar_stall_wait_special_reappear = False
+            self._female_bar_stall_special_hidden_once = False
             self._special_action_monitor_thread = threading.Thread(
                 target=self._special_action_monitor_loop, daemon=True
             )
@@ -713,7 +798,12 @@ class AutomationEngine:
         while self.actions.ready_to_start():
             if self._wait_if_paused_or_interrupted():
                 return False
-            self.actions.start()
+            clicked = self.actions.start()
+            if not clicked:
+                # 去抖点击未达成“按钮稳定消失”时，不推进后续动作，避免误进入下一阶段。
+                self.state.log("停滞恢复：开始按钮点击未确认，重试")
+                sleep(0.12)
+                continue
             self.state.log("停滞恢复：点击开始")
             x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
             pyautogui.moveTo(x, y)
@@ -727,6 +817,8 @@ class AutomationEngine:
             self._f1_hotkey_handle = keyboard.add_hotkey("f1", self._toggle_pause_by_f1, suppress=False)
         if self._f2_hotkey_handle is None:
             self._f2_hotkey_handle = keyboard.add_hotkey("f2", self._pause_and_switch_next_experiment_by_f2, suppress=False)
+        if self._f3_hotkey_handle is None:
+            self._f3_hotkey_handle = keyboard.add_hotkey("f3", self._toggle_like_force_next_by_f3, suppress=False)
         if self._f11_hotkey_handle is None:
             self._f11_hotkey_handle = keyboard.add_hotkey("f11", self._replay_pull_new_experiment_scroll_by_f11, suppress=False)
         if self._f12_hotkey_handle is None:
@@ -739,12 +831,20 @@ class AutomationEngine:
         if self._f2_hotkey_handle is not None:
             keyboard.remove_hotkey(self._f2_hotkey_handle)
             self._f2_hotkey_handle = None
+        if self._f3_hotkey_handle is not None:
+            keyboard.remove_hotkey(self._f3_hotkey_handle)
+            self._f3_hotkey_handle = None
         if self._f11_hotkey_handle is not None:
             keyboard.remove_hotkey(self._f11_hotkey_handle)
             self._f11_hotkey_handle = None
         if self._f12_hotkey_handle is not None:
             keyboard.remove_hotkey(self._f12_hotkey_handle)
             self._f12_hotkey_handle = None
+        # 兜底：移除本进程注册的其余钩子，避免关闭后热键仍驻留导致“像没退出”。
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
 
     def loop_once(self):
         experiment_switch_enabled = bool(self.config_store.data.get("experiment_switch_enabled", False))
@@ -838,7 +938,13 @@ class AutomationEngine:
         while self.actions.ready_to_start():
             if self._wait_if_paused_or_interrupted():
                 return
-            self.actions.start()
+            clicked = self.actions.start()
+            if not clicked:
+                # 关键：若本轮未确认成功（按钮未稳定消失），留在当前阶段继续重试。
+                # 这样可抑制“模板瞬时抖动 -> 误判已点击 -> 流程跳转”的问题。
+                self.state.log("开始按钮点击未确认，重试")
+                sleep(0.12)
+                continue
             self.state.log("点击开始")
             x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
             pyautogui.moveTo(x, y)
@@ -857,8 +963,11 @@ class AutomationEngine:
                 self._female_bar_monitor_active = True
                 # 新规则：女进度条停滞判断仅在“点击开始按钮后延迟3秒”才生效。
                 self._female_bar_stall_suspend_until = time() + 3.0
-            self._female_bar_stall_wait_increase = False
-            self._female_bar_stall_resume_baseline = None
+            self._female_bar_stall_wait_special_reappear = False
+            self._female_bar_stall_special_hidden_once = False
+            # 新一轮「开始~高潮」阶段：刷新令牌，使旧线程中待发送的「1」全部失效。
+            self._special_action_phase_token += 1
+            self._special_action_expected_token = self._special_action_phase_token
             self._special_action_monitor_active = True
 
             # 仅在“点击开始后~点击高潮前”阶段启用滚轮纠偏。
@@ -942,6 +1051,8 @@ class AutomationEngine:
                 self._clear_scroll_command()
                 self._female_bar_monitor_active = False
                 self._special_action_monitor_active = False
+                # 离开阶段：递增令牌，使特殊动作线程内任何未完成的延迟按键被取消。
+                self._special_action_phase_token += 1
 
             if not stall_detected:
                 break
@@ -952,7 +1063,11 @@ class AutomationEngine:
         while self.actions.ready_to_cum():
             if self._wait_if_paused_or_interrupted():
                 return
-            self.actions.cum()
+            clicked = self.actions.cum()
+            if not clicked:
+                self.state.log("高潮按钮点击未确认，重试")
+                self.actions.wait(0.12)
+                continue
             self.state.log("点击高潮")
             # 高潮阶段点击优先速度，缩短间隔。
             self.actions.wait(0.1)
@@ -966,7 +1081,11 @@ class AutomationEngine:
         while self.actions.ready_to_finish():
             if self._wait_if_paused_or_interrupted():
                 return
-            self.actions.finish()
+            clicked = self.actions.finish()
+            if not clicked:
+                self.state.log("结束按钮点击未确认，重试")
+                self.actions.wait(0.12)
+                continue
             self.state.log("点击结束")
             self.actions.wait(0.2)
             with self.state.lock:
@@ -1005,8 +1124,10 @@ class AutomationEngine:
         self._start_scroll_worker()
         self._start_female_bar_monitor()
         self._start_special_action_monitor()
-        sleep(2)
-        self.state.set_status("初始化完成")
+        # 原固定 sleep(2) 会在用户立刻关闭窗口时仍阻塞 2 秒，延迟释放热键与退出。
+        _sleep_interruptible(2.0, self.state)
+        if not self.state.stop_requested:
+            self.state.set_status("初始化完成")
         try:
             while not self.state.stop_requested:
                 if self.state.manual_pause:
@@ -1016,7 +1137,8 @@ class AutomationEngine:
                         "取消标定",
                     ) and not self.state.current_status.startswith("已应用标定"):
                         self.state.set_status("手动暂停")
-                    sleep(0.2)
+                    # 分段睡眠，便于 stop_requested 后尽快结束循环
+                    _sleep_interruptible(0.2, self.state)
                     continue
 
                 try:
@@ -1024,7 +1146,7 @@ class AutomationEngine:
                 except Exception as exc:
                     self.state.set_status(f"异常: {exc}")
                     print(f"\n发生异常：{exc}")
-                    sleep(1)
+                    _sleep_interruptible(1.0, self.state)
         finally:
             self._scroll_enabled = False
             self._clear_scroll_command()

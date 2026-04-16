@@ -22,8 +22,8 @@ BTN_BG = "#334155"
 BTN_HOVER = "#475569"
 BTN_DANGER = "#b83b3b"
 BTN_SUCCESS = "#3aa655"
-
-
+# 自定义标题栏区域：与主内容区背景区分，便于一眼分辨“可拖动标题区 / 内容区”
+HEADER_BAR_BG = "#0b1224"
 class CalibrationOverlay:
     """单项标定层：按标定类型绘制矩形或圆点。"""
 
@@ -805,20 +805,29 @@ def launch_floating_window(config_store, state, window_service):
 
     root = tk.Tk()
     root.title("autoFDX 悬浮窗")
-    # 根据屏幕自适应窗口宽度，保证按钮显示完整又不会超出屏幕。
+    # 根据屏幕自适应窗口宽度（收紧版）：
+    # 在当前两列紧凑布局下，整体宽度可适当下调，减少横向占位。
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
-    win_w = min(980, max(760, screen_w - 80))
+    win_w = min(780, max(620, screen_w - 200))
     saved_pos = config_store.data.get("ui_window_pos", [20, 20])
     if not isinstance(saved_pos, list) or len(saved_pos) != 2:
         saved_pos = [20, 20]
     win_x = int(saved_pos[0])
     win_y = int(saved_pos[1])
-    # 启动时做一次边界约束，防止历史坐标落在屏幕外。
-    win_x = max(0, min(max(0, screen_w - 220), win_x))
-    win_y = max(0, min(max(0, screen_h - 140), win_y))
-    win_h_expanded = 460
-    win_h_collapsed = 280
+    # 状态与控件布局收紧后，折叠态先给保守高度，启动后再按内容收紧（fit_collapsed_height）。
+    win_h_expanded = 500
+    win_h_collapsed = 260
+
+    def clamp_window_pos(req_h, px, py):
+        """将窗口左上角约束在当前屏幕工作区内，保证整块窗口可见（含多显示器保存坐标拉回主屏）。"""
+        cx = max(0, min(max(0, screen_w - win_w), int(px)))
+        cy = max(0, min(max(0, screen_h - req_h), int(py)))
+        return cx, cy
+
+    # 启动时边界约束：必须用「屏幕尺寸 - 窗口宽高」，否则窗口会整体落到屏幕外（多显示器/历史坐标常见）。
+    # 旧逻辑用 screen_h-140 未计入窗口高度，易导致底边超出可视区甚至完全看不到。
+    win_x, win_y = clamp_window_pos(win_h_collapsed, win_x, win_y)
     root.geometry(f"{win_w}x{win_h_collapsed}+{win_x}+{win_y}")
     # 使用内嵌窗口控制按钮，隐藏系统边框与标题栏。
     root.overrideredirect(True)
@@ -829,6 +838,7 @@ def launch_floating_window(config_store, state, window_service):
     # 优先使用 Windows 主题，按钮外观更接近圆角。
     if "vista" in like_chk_style.theme_names():
         like_chk_style.theme_use("vista")
+    # padding 左右/上下尽量对称，便于指示器与文字在控件内垂直方向视觉居中。
     like_chk_style.configure(
         "Like.Big.TCheckbutton",
         font=("Microsoft YaHei UI", 10),
@@ -840,6 +850,20 @@ def launch_floating_window(config_store, state, window_service):
     like_chk_style.map(
         "Like.Big.TCheckbutton",
         background=[("active", BG_CARD), ("disabled", BG_CARD), ("!disabled", BG_CARD)],
+        foreground=[("disabled", FG_MUTED), ("!disabled", FG_MAIN)],
+    )
+    # 标题栏内勾选框：背景与 HEADER_BAR_BG 一致，避免色块割裂
+    like_chk_style.configure(
+        "Like.Header.TCheckbutton",
+        font=("Microsoft YaHei UI", 10),
+        indicatorsize=22,
+        padding=(6, 5),
+        background=HEADER_BAR_BG,
+        foreground=FG_MAIN,
+    )
+    like_chk_style.map(
+        "Like.Header.TCheckbutton",
+        background=[("active", HEADER_BAR_BG), ("disabled", HEADER_BAR_BG), ("!disabled", HEADER_BAR_BG)],
         foreground=[("disabled", FG_MUTED), ("!disabled", FG_MAIN)],
     )
 
@@ -897,11 +921,11 @@ def launch_floating_window(config_store, state, window_service):
         on_title_press(event)
 
     def refresh_pin_button():
-        # 悬浮按钮：控制是否保持悬浮显示。
+        # 固定按钮：控制是否保持置顶固定显示。
         if is_pinned_topmost:
-            btn_win_pin.set_text("悬浮中")
+            btn_win_pin.set_text("固定中")
         else:
-            btn_win_pin.set_text("悬浮")
+            btn_win_pin.set_text("固定")
 
     def on_toggle_pin():
         nonlocal is_pinned_topmost
@@ -945,11 +969,13 @@ def launch_floating_window(config_store, state, window_service):
             if enabled:
                 exstyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP
             else:
-                exstyle &= ~WS_EX_NOREDIRECTIONBITMAP
+                # 关闭全屏兼容时移除分层相关标志，避免未分层却调用 SetLayeredWindowAttributes 导致显示异常
+                exstyle &= ~(WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TOOLWINDOW)
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
 
-            # 维持可见度：使用分层窗口不透明 alpha。
-            user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+            # SetLayeredWindowAttributes 仅在窗口带 WS_EX_LAYERED 时合法；否则部分环境下会导致客户区不可见或调用失败。
+            if enabled:
+                user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
 
             top_hwnd = HWND_TOPMOST if is_pinned_topmost else HWND_NOTOPMOST
             user32.SetWindowPos(
@@ -1074,7 +1100,7 @@ def launch_floating_window(config_store, state, window_service):
             var = tk.BooleanVar(value=(key in selected_now))
             selector_vars[key] = var
             chk = ttk.Checkbutton(card, text=label, variable=var, style="Like.Big.TCheckbutton")
-            chk.grid(row=1 + (i // col_count), column=i % col_count, sticky="w", padx=4, pady=3)
+            chk.grid(row=1 + (i // col_count), column=i % col_count, sticky="nsew", padx=4, pady=3)
 
         btn_row = tk.Frame(card, bg=BG_CARD)
         btn_row.grid(row=1 + (len(CALIBRATION_ITEMS) // col_count) + 1, column=0, columnspan=3, sticky="e", pady=(10, 0))
@@ -1099,16 +1125,18 @@ def launch_floating_window(config_store, state, window_service):
         selector_win.protocol("WM_DELETE_WINDOW", on_cancel)
 
     def toggle_submenu():
-        cur_x = int(root.winfo_x())
-        cur_y = int(root.winfo_y())
         if submenu_host.winfo_ismapped():
             submenu_host.pack_forget()
-            # 标定面板收起时同步缩短窗口高度，让下边沿回收。
-            root.geometry(f"{win_w}x{win_h_collapsed}+{cur_x}+{cur_y}")
+            nh = win_h_collapsed
         else:
             submenu_host.pack(fill="both", expand=True, pady=(4, 0))
-            # 展开标定面板时恢复完整高度。
-            root.geometry(f"{win_w}x{win_h_expanded}+{cur_x}+{cur_y}")
+            nh = win_h_expanded
+        # 高度变化后重新夹紧，避免拉高后底边超出屏幕
+        cx, cy = clamp_window_pos(nh, root.winfo_x(), root.winfo_y())
+        root.geometry(f"{win_w}x{nh}+{cx}+{cy}")
+        # 收起标定菜单后再按实际内容收紧高度（fit_collapsed_height 在下方定义）
+        if not submenu_host.winfo_ismapped():
+            root.after(10, fit_collapsed_height)
 
     def trigger_item(item_key):
         state.pending_calibration = item_key
@@ -1292,35 +1320,37 @@ def launch_floating_window(config_store, state, window_service):
         else:
             state.set_status("已切换常规悬浮模式")
 
-    frame = tk.Frame(root, padx=14, pady=14, bg=BG_APP)
+    # 不再使用外层加粗描边框（用户反馈过宽）；内容区直接铺满根窗口。
+    frame = tk.Frame(root, padx=10, pady=8, bg=BG_APP)
     frame.pack(fill="both", expand=True)
-    header_card = tk.Frame(frame, bg=BG_CARD, padx=10, pady=8)
-    header_card.pack(fill="x", pady=(0, 10))
-    title_row = tk.Frame(header_card, bg=BG_CARD)
+
+    # 标题栏：单独一块深色背景，仅放标题 / 提示 / 窗口控制，与下方主内容区分界清晰
+    title_bar = tk.Frame(frame, bg=HEADER_BAR_BG, padx=8, pady=6)
+    title_bar.pack(fill="x", pady=(0, 0))
+    title_row = tk.Frame(title_bar, bg=HEADER_BAR_BG)
     title_row.pack(fill="x")
-    lbl_title = tk.Label(title_row, text="autoFDX 控制台", fg=FG_MAIN, bg=BG_CARD, font=("Microsoft YaHei UI", 11, "bold"))
-    lbl_title.pack(side="left", anchor="w")
-    tk.Label(
+    lbl_title = tk.Label(
+        title_row, text="autoFDX 控制台", fg=FG_MAIN, bg=HEADER_BAR_BG, font=("Microsoft YaHei UI", 11, "bold")
+    )
+    lbl_f1_hint = tk.Label(
         title_row,
-        text="按“F1”键紧急暂停",
+        text="“F1”键暂停",
         fg=FG_MUTED,
-        bg=BG_CARD,
+        bg=HEADER_BAR_BG,
         font=("Microsoft YaHei UI", 9),
-    ).pack(side="left", padx=(10, 0), anchor="w")
-    win_btn_host = tk.Frame(title_row, bg=BG_CARD)
-    # 内嵌窗口控制按钮贴靠标题区右上角。
-    win_btn_host.place(relx=1.0, x=0, y=0, anchor="ne")
+    )
+    win_btn_host = tk.Frame(title_row, bg=HEADER_BAR_BG)
     chk_overlay_dx = ttk.Checkbutton(
         win_btn_host,
         text="全屏模式兼容",
         variable=overlay_dx_var,
         command=on_overlay_dx_toggle,
-        style="Like.Big.TCheckbutton",
+        style="Like.Header.TCheckbutton",
         cursor="hand2",
     )
     btn_win_pin = create_round_button(
         win_btn_host,
-        text="悬浮中",
+        text="固定中",
         command=on_toggle_pin,
         width=100,
         height=32,
@@ -1341,33 +1371,58 @@ def launch_floating_window(config_store, state, window_service):
         radius=12,
         font=("Microsoft YaHei UI", 11, "bold"),
     )
-    chk_overlay_dx.pack(side="left", padx=(0, 8))
+    # 先固定右侧控件组，再从左侧 pack，保证标题/提示与勾选、按钮在同一行内垂直居中对齐。
+    chk_overlay_dx.pack(side="left", padx=(0, 8), anchor="center")
     for btn in (btn_win_pin, btn_win_close):
-        btn.pack(side="left", padx=2)
+        btn.pack(side="left", padx=2, anchor="center")
+    win_btn_host.pack(side="right", anchor="center")
+    lbl_title.pack(side="left", anchor="center")
+    lbl_f1_hint.pack(side="left", padx=(10, 0), anchor="center")
     refresh_pin_button()
-    # 自定义标题栏拖动窗口。
-    for w in (title_row, lbl_title):
+    # 自定义标题栏拖动窗口（标题栏整块可拖，避免误拖内容区）
+    for w in (title_bar, title_row, lbl_title, lbl_f1_hint, win_btn_host, chk_overlay_dx, btn_win_pin, btn_win_close):
         w.bind("<ButtonPress-1>", on_title_press)
         w.bind("<B1-Motion>", on_title_drag)
-    # 将“流程/状态”与右侧勾选区改为双列固定布局：
-    # 左列状态文本自适应，右列控件固定靠右，避免状态字数变化导致右侧位移。
-    status_row = tk.Frame(header_card, bg=BG_CARD)
-    status_row.pack(fill="x", pady=(3, 0))
-    status_row.grid_columnconfigure(0, weight=1)
-    status_row.grid_columnconfigure(1, weight=0)
+
+    # 标题栏与主内容区之间的分隔线，强化层次
+    title_sep = tk.Frame(frame, bg="#334155", height=1)
+    title_sep.pack(fill="x", pady=(0, 0))
+
+    # 主内容区：与标题栏背景区分；状态与勾选分两行，避免长文案与勾选框同一行重叠
+    # 注意：Frame 构造参数 pady 必须是单值，不能传 (top, bottom) 元组；
+    # 否则 Tk 会抛出 TclError（bad screen distance），导致窗口启动即失败。
+    content_card = tk.Frame(frame, bg=BG_CARD, padx=8, pady=6)
+    # 上提主内容卡片，紧贴标题分隔线下方。
+    content_card.pack(fill="x", pady=(0, 4))
+    # 主内容区按 2 列布局：
+    # - 左列分两行：上=状态、下=主按钮
+    # - 右列：勾选框
+    content_grid = tk.Frame(content_card, bg=BG_CARD)
+    content_grid.pack(fill="x")
+    content_grid.grid_columnconfigure(0, weight=1)
+    content_grid.grid_columnconfigure(1, weight=0)
+    content_grid.grid_rowconfigure(0, weight=0)
+    content_grid.grid_rowconfigure(1, weight=0)
+
+    left_status_frame = tk.Frame(content_grid, bg=BG_CARD)
+    left_status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
     status_text_label = tk.Label(
-        status_row,
+        left_status_frame,
         textvariable=status_line_var,
         fg="#93c5fd",
         bg=BG_CARD,
         font=("Microsoft YaHei UI", 10),
         anchor="w",
+        justify="left",
+        # 左列预留给右侧勾选区，状态文本只在左列内换行。
+        wraplength=max(320, win_w - 360),
     )
-    status_text_label.grid(row=0, column=0, sticky="w")
+    # anchor=center：在父 Frame 行高大于标签内容时，整块状态文案在垂直方向居中（单行时无影响）。
+    status_text_label.pack(fill="x", anchor="center")
 
-    # 主控制按钮横向排列，避免纵向堆叠占用空间。
-    top_btn_frame = tk.Frame(frame, bg=BG_APP)
-    top_btn_frame.pack(fill="x", pady=(0, 8))
+    # 左列第二行：主控制按钮，紧贴状态下方。
+    top_btn_frame = tk.Frame(content_grid, bg=BG_CARD)
+    top_btn_frame.grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(0, 0))
     btn_pause = create_round_button(
         top_btn_frame,
         pause_button_text(),
@@ -1391,51 +1446,49 @@ def launch_floating_window(config_store, state, window_service):
         radius=16,
         font=("Microsoft YaHei UI", 11, "bold"),
     )
-    btn_exit = create_round_button(
-        top_btn_frame,
-        "退出脚本",
-        on_exit,
-        168,
-        42,
-        BTN_DANGER,
-        "#dc2626",
-        fg="white",
-        radius=16,
-        font=("Microsoft YaHei UI", 11, "bold"),
-    )
-    for btn in (btn_pause, btn_menu, btn_exit):
-        btn.pack(side="left", padx=4)
+    # 原第三颗「退出脚本」已取消（标题栏 ✕ 关闭即可）；此处保留同尺寸占位，避免两键左移改变布局。
+    btn_exit_spacer = tk.Frame(top_btn_frame, width=168, height=42, bg=BG_CARD)
+    btn_exit_spacer.pack_propagate(False)
+    for btn in (btn_pause, btn_menu):
+        btn.pack(side="left", padx=4, anchor="center")
+    btn_exit_spacer.pack(side="left", padx=4, anchor="center")
 
-    # 点赞控制开关移到状态区右侧，减少纵向占位。
-    like_option_frame = tk.Frame(status_row, bg=BG_CARD)
-    like_option_frame.grid(row=0, column=1, sticky="e")
+    # 右列：勾选项竖向排列、左端对齐；用 grid 上下行 weight 均分，使整列在「状态+按钮」总高度内垂直居中。
+    like_option_frame = tk.Frame(content_grid, bg=BG_CARD, padx=1, pady=2)
+    like_option_frame.grid(row=0, column=1, rowspan=2, sticky="ns")
+    like_option_frame.grid_columnconfigure(0, weight=1)
+    like_option_frame.grid_rowconfigure(0, weight=1)
+    like_option_frame.grid_rowconfigure(1, weight=0)
+    like_option_frame.grid_rowconfigure(2, weight=1)
+    like_option_right = tk.Frame(like_option_frame, bg=BG_CARD)
+    like_option_right.grid(row=1, column=0, sticky="w")
     chk_like_enabled = ttk.Checkbutton(
-        like_option_frame,
+        like_option_right,
         text="启用点赞功能",
         variable=like_enabled_var,
         command=on_like_enabled_toggle,
         style="Like.Big.TCheckbutton",
         cursor="hand2",
     )
-    chk_like_enabled.pack(side="left", padx=(8, 4))
+    chk_like_enabled.pack(anchor="w", pady=(0, 2))
     chk_experiment_switch = ttk.Checkbutton(
-        like_option_frame,
+        like_option_right,
         text="启用实验切换",
         variable=experiment_switch_enabled_var,
         command=on_experiment_switch_toggle,
         style="Like.Big.TCheckbutton",
         cursor="hand2",
     )
-    chk_experiment_switch.pack(side="left", padx=(4, 4))
+    chk_experiment_switch.pack(anchor="w", pady=2)
     chk_like_force = ttk.Checkbutton(
-        like_option_frame,
-        text="结束后执行点赞",
+        like_option_right,
+        text="结束后执行点赞-F3",
         variable=like_force_next_var,
         command=on_like_force_next_toggle,
         style="Like.Big.TCheckbutton",
         cursor="hand2",
     )
-    chk_like_force.pack(side="left", padx=(4, 0))
+    chk_like_force.pack(anchor="w", pady=(2, 0))
     refresh_like_force_state()
 
     submenu_host = tk.Frame(frame, bg=BG_APP)
@@ -1480,22 +1533,46 @@ def launch_floating_window(config_store, state, window_service):
     root.bind_all("<MouseWheel>", _on_mousewheel, add="+")
     root.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel, add="+")
     # 标定按钮横向网格排布：优先 4 列，空间不足时退化为 3 列。
-    column_count = 4 if win_w >= 900 else 3
+    column_count = 4 if win_w >= 820 else 3
     for key, label in CALIBRATION_ITEMS:
         idx = len(calib_buttons)
         row = idx // column_count
         col = idx % column_count
         btn = tk.Button(submenu_frame, text=label, width=12, command=lambda k=key: trigger_item(k))
         style_button(btn, normal_bg=BTN_DANGER, hover_bg="#dc2626")
-        btn.grid(row=row, column=col, padx=4, pady=4, sticky="ew")
+        btn.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
         calib_buttons[key] = btn
 
     for col in range(column_count):
         submenu_frame.grid_columnconfigure(col, weight=1)
 
+    def fit_collapsed_height():
+        """
+        未展开标定菜单时，将窗口高度收束到实际内容高度，消除底部大块留白。
+        仅在折叠态调用；展开态由 win_h_expanded 控制。
+        """
+        nonlocal win_h_collapsed
+        try:
+            if submenu_host.winfo_ismapped():
+                return
+        except tk.TclError:
+            return
+        root.update_idletasks()
+        h = max(200, int(root.winfo_reqheight()))
+        win_h_collapsed = h
+        cx, cy = clamp_window_pos(h, root.winfo_x(), root.winfo_y())
+        root.geometry(f"{win_w}x{h}+{cx}+{cy}")
+
     root.bind("<Configure>", on_root_configure, add="+")
     root.protocol("WM_DELETE_WINDOW", on_exit)
     apply_overlay_mode(force=True)
+    # overrideredirect 窗口在部分环境下需显式 deiconify/lift，避免启动后落在其它窗口后不可见
+    root.update_idletasks()
+    root.deiconify()
+    root.lift()
+    root.attributes("-topmost", is_pinned_topmost)
+    # 首次布局完成后收紧折叠高度（标定菜单默认收起）
+    root.after(80, fit_collapsed_height)
 
     def refresh():
         status_var.set(f"流程: {state.current_status}")

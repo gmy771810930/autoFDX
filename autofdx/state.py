@@ -1,8 +1,6 @@
 import threading
 from time import time
 
-import pyautogui
-
 
 class RuntimeState:
     """运行态：流程状态、暂停/停止控制、循环计数。"""
@@ -47,9 +45,9 @@ class RuntimeState:
     def log(self, buf):
         # 复用原打印逻辑，避免用户使用习惯变化。
         self.set_status(buf)
-        if time() - self.op_time > 120:
-            pyautogui.press("1")
-            self.op_time = time()
+        # 注意：禁止在此处注入任何真实按键（例如 pyautogui.press("1")）。
+        # 旧版曾用「长时间重复同一条日志则按 1」做调试，会导致未进入主流程、
+        # 甚至未点击「继续」时仍偶发按键，与业务完全无关。
         if buf != self.info:
             self.op_time = time()
             self.info = buf
