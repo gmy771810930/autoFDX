@@ -183,41 +183,44 @@ class VisionService:
             cv2.COLOR_RGB2BGR,
         )
 
-    def build_hsv_mask(self, hsv_img, hsv_center, hsv_tol):
-        h, s, v = hsv_center
-        th, ts, tv = hsv_tol
-        low_h, high_h = h - th, h + th
-        low_s, high_s = max(0, s - ts), min(255, s + ts)
-        low_v, high_v = max(0, v - tv), min(255, v + tv)
-        if low_h < 0:
-            return cv2.inRange(hsv_img, np.array([0, low_s, low_v]), np.array([high_h, high_s, high_v])) + cv2.inRange(
-                hsv_img, np.array([180 + low_h, low_s, low_v]), np.array([179, high_s, high_v])
-            )
-        if high_h > 179:
-            return cv2.inRange(hsv_img, np.array([low_h, low_s, low_v]), np.array([179, high_s, high_v])) + cv2.inRange(
-                hsv_img, np.array([0, low_s, low_v]), np.array([high_h - 180, high_s, high_v])
-            )
-        return cv2.inRange(hsv_img, np.array([low_h, low_s, low_v]), np.array([high_h, high_s, high_v]))
+    def _build_red_mask_bgr(self, bgr_img):
+        """
+        与 GameActions._build_red_mask 同口径：红色跨 H=0/179，双区间合并。
+        女/男快感条在游戏内均为「红色填充」，用固定红掩膜比「整图 HSV 中值 + 容差」更稳：
+        标定截图里若混入灰底、描边或邻近 UI，sample_hsv_profile 的中值易偏离真红，导致两掩膜系统性偏一侧。
+        """
+        if bgr_img is None or bgr_img.size == 0:
+            return None
+        hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+        mask1 = cv2.inRange(hsv, np.array([0, 55, 50]), np.array([12, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([168, 55, 50]), np.array([179, 255, 255]))
+        return cv2.bitwise_or(mask1, mask2)
 
     def detect_bars(self, image):
+        """
+        从 bar_regions 裁切女(bar1)、男(bar2)区域，估计红色填充进度。
+        注意：与自动化里敏感条(蓝)无关；仅女/男两条参与差分纠偏。
+        """
         bars = self.config["bar_regions"]
-        prof = self.config["bar_profiles"]
         x1a, y1a, x1b, y1b = self.window_service.denormalize_region(bars["bar1"])
         x2a, y2a, x2b, y2b = self.window_service.denormalize_region(bars["bar2"])
         bar1 = image[y1a:y1b, x1a:x1b]
         bar2 = image[y2a:y2b, x2a:x2b]
         if bar1.size == 0 or bar2.size == 0:
             return 0, 0
-        m1 = self.build_hsv_mask(cv2.cvtColor(bar1, cv2.COLOR_BGR2HSV), prof["bar1"]["hsv"], prof["bar1"]["tol"])
-        m2 = self.build_hsv_mask(cv2.cvtColor(bar2, cv2.COLOR_BGR2HSV), prof["bar2"]["hsv"], prof["bar2"]["tol"])
+        m1 = self._build_red_mask_bgr(bar1)
+        m2 = self._build_red_mask_bgr(bar2)
+        if m1 is None or m2 is None:
+            return 0, 0
         return self._bar_fill_score(m1), self._bar_fill_score(m2)
 
     def _bar_fill_score(self, mask):
         """
         进度条填充估计（比纯面积占比更稳定）：
-        1) area_ratio: 红色像素占比
-        2) length_ratio: 红色连续填充长度（按列）
-        最终以 length_ratio 为主，area_ratio 为辅，减少“底色噪声导致方向反了”的问题。
+        1) area_ratio: 前景像素占比
+        2) length_ratio: 按列连续填充长度（从左向右）
+        最终以 length_ratio 为主，area_ratio 为辅。
+        掩膜来源为红色区间时，即表示红条填充进度。
         """
         if mask.size == 0:
             return 0.0

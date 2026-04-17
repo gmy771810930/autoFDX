@@ -188,6 +188,14 @@ class ConfigStore:
             self.data["calibration_done"].setdefault(key, False)
             self.data["calibration_rects"].setdefault(key, defaults["calibration_rects"][key])
 
+        # 女/男进度条：vision.detect_bars 读 bar_regions；与 calibration_rects 中 bar_female/bar_male 必须一致，避免手工改配置后不同步。
+        cr = self.data["calibration_rects"]
+        br = self.data.setdefault("bar_regions", defaults["bar_regions"])
+        if isinstance(cr.get("bar_female"), list) and len(cr["bar_female"]) == 4:
+            br["bar1"] = list(cr["bar_female"])
+        if isinstance(cr.get("bar_male"), list) and len(cr["bar_male"]) == 4:
+            br["bar2"] = list(cr["bar_male"])
+
         # 清理已废弃的旧标定项，避免后续维护混淆。
         self.data["calibration_done"].pop("bar_area", None)
         self.data["calibration_rects"].pop("bar_area", None)

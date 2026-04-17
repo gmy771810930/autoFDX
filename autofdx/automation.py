@@ -97,6 +97,11 @@ class AutomationEngine:
         # 降低 pyautogui 全局动作间隔，避免滚轮动作被库默认节流。
         # 调整为 0：进一步提升连续滚轮吞吐，解决“滚动距离/次数偏小”的问题。
         pyautogui.PAUSE = 0
+        # 自本进程启动起的运行统计（仅内存，不落盘）：用于日志汇总。
+        # - 高潮成功：每次 cum() 点击确认成功 +1。
+        # - 「5回合」实验单元：实验切换开启时，当前卡已跑满 4 个完整回合后的第 5 次成功高潮 +1（与换卡逻辑一致）。
+        self._runtime_total_cum_successes = 0
+        self._runtime_total_five_round_experiments = 0
         # PyAutoGUI 默认 failsafe：光标停在屏幕四角时，下一次任意操作会抛异常以防失控。
         # 本脚本会把鼠标移到窗口边角安全位（如 safe_move_point）、全屏/无边框下也易贴近物理屏幕角，
         # 与用户手操或特殊动作恢复流程叠加时易误触，导致主循环异常中断（例如特殊动作日志刚打印后崩溃）。
@@ -122,6 +127,16 @@ class AutomationEngine:
         except Exception:
             return True
         return False
+
+    def _print_runtime_experiment_stats(self):
+        """在控制台输出自程序启动以来的高潮次数与「5回合」完成个数。"""
+        extra = ""
+        if not bool(self.config_store.data.get("experiment_switch_enabled", False)):
+            extra = "（「5回合」计数需开启实验切换）"
+        print(
+            f"\n[统计] 自程序启动：高潮成功 {self._runtime_total_cum_successes} 次；"
+            f"完成「5回合」实验 {self._runtime_total_five_round_experiments} 个（以该组第 5 次成功高潮为准）{extra}"
+        )
 
     def _read_card_index_from_config(self):
         """
@@ -190,6 +205,19 @@ class AutomationEngine:
         print(f"\n[实验切换] 缺少标定项：{', '.join(missing)}，已自动暂停。")
         return False
 
+    def _retry_experiment_panel_and_click_same_card(self, card_index_1based):
+        """
+        当「点击实验卡片后未出现实验选定标志」时，不一定是卡槽用尽：
+        常见为界面未就绪、动画偏慢、模板瞬时未匹配。
+        本函数：ESC 关闭 → 再按 E 打开面板 → 稍等后再次点击同一张卡片。
+        返回 True 表示再次点击已执行（不保证标志出现）。
+        """
+        pyautogui.press("esc")
+        sleep(1.0)
+        self.actions.press_experiment_switch_hotkey()
+        sleep(1.2)
+        return bool(self.actions.click_experiment_card(card_index_1based))
+
     def _run_experiment_switch_bootstrap(self):
         """
         实验切换开启后的首次运行流程：
@@ -251,10 +279,13 @@ class AutomationEngine:
                     self._experiment_card_index = 1
                     self._save_card_index_to_config(self._experiment_card_index)
                     continue
-                # 5号身体部位实验也已用尽，全郠实验完成。
+                # 5号身体部位：12 张卡仍全部无法确认选定标志，视为本流程结束。
                 self.state.manual_pause = True
                 self.state.set_status("全部实验已完成，程序暂停")
-                print("\n[实验已用尽] 身体部位2号与5号的实验均已用尽，全部实验完成，程序已暂停。")
+                print(
+                    "\n[实验已用尽] 身体部位5号上 12 张卡片仍无法确认选定标志。"
+                    "若仍有可用实验，请检查「实验选定标志」标定或重试。"
+                )
                 return False
 
             self._save_card_index_to_config(self._experiment_card_index)
@@ -270,15 +301,31 @@ class AutomationEngine:
                 )
                 return False
 
-            # 流程.md 第3条：点击实验卡片后 2s 内检测"实验选定标志"。
-            _sel_flag_sec = 2.0
-            if not self.actions.wait_experiment_selected_flag(timeout_sec=_sel_flag_sec):
-                # 【实验已用尽】当前卡片无法选中（未出现实验选定标志）。
+            # 流程.md 第3条：点击后检测「实验选定标志」。
+            # 原 2s 偏紧，且单次未匹配易被误判为「卡槽用尽」；拉长超时并允许重开面板再点同卡一次。
+            sel_flag_timeout_sec = 3.5
+            got_flag = self.actions.wait_experiment_selected_flag(timeout_sec=sel_flag_timeout_sec)
+            if not got_flag:
+                print(
+                    "\n[实验切换] 首次未在超时内检测到实验选定标志，"
+                    "将重开实验面板并再次点击同一张卡片（避免界面延迟/模板瞬时未匹配误判为已用尽）。"
+                )
+                if not self._retry_experiment_panel_and_click_same_card(self._experiment_card_index):
+                    self.state.manual_pause = True
+                    self.state.set_status("实验切换失败: 实验卡片点位不可用")
+                    print(
+                        f"\n[实验切换] 已暂停：重试时实验卡片点位不可用，当前索引={self._experiment_card_index}。"
+                    )
+                    return False
+                got_flag = self.actions.wait_experiment_selected_flag(timeout_sec=sel_flag_timeout_sec)
+
+            if not got_flag:
+                # 两次尝试后仍无标志：多数为当前卡槽在游戏内不可用，或「实验选定标志」标定/阈值需检查。
                 if self._current_body_part_index != 5:
                     self.state.set_status("实验已用尽：切换到身体部位5号")
                     print(
-                        f"\n[实验已用尽] 卡片{self._experiment_card_index}号无法选中，"
-                        f"切换身体部位 {self._current_body_part_index}号→5号，重置实验点位为1。"
+                        f"\n[实验已用尽] 卡片{self._experiment_card_index}号经两次检测仍无实验选定标志，"
+                        f"将假定当前身体部位该槽不可用，切换身体部位 {self._current_body_part_index}号→5号，重置实验点位为1。"
                     )
                     self.actions.click_body_part(2)
                     sleep(0.5)
@@ -287,10 +334,13 @@ class AutomationEngine:
                     self._experiment_card_index = 1
                     self._save_card_index_to_config(self._experiment_card_index)
                     continue
-                # 5号身体部位实验也已用尽，全部实验完成。
+                # 5号身体部位仍失败：可能真已无可用实验，也可能是标志模板未稳定匹配。
                 self.state.manual_pause = True
                 self.state.set_status("全部实验已完成，程序暂停")
-                print("\n[实验已用尽] 身体部位2号与5号的实验均已用尽，全部实验完成，程序已暂停。")
+                print(
+                    "\n[实验已用尽] 在身体部位5号上仍无法确认实验选定标志。"
+                    "若你确认仍有可用实验，请检查「实验选定标志」标定与模板匹配阈值，或适当提高游戏帧率/关闭遮挡。"
+                )
                 return False
 
             # ── 流程.md 第4条：【尝试部署实验】──
@@ -1069,6 +1119,11 @@ class AutomationEngine:
                 self.actions.wait(0.12)
                 continue
             self.state.log("点击高潮")
+            # 累计统计：每次确认成功的高潮点击；第 5 次成功高潮（且已开启实验切换、本卡已跑完前 4 回合）计为一个「5回合」实验单元。
+            self._runtime_total_cum_successes += 1
+            if experiment_switch_enabled and self._experiment_cycle_count == 4:
+                self._runtime_total_five_round_experiments += 1
+            self._print_runtime_experiment_stats()
             # 高潮阶段点击优先速度，缩短间隔。
             self.actions.wait(0.1)
 
@@ -1148,6 +1203,10 @@ class AutomationEngine:
                     print(f"\n发生异常：{exc}")
                     _sleep_interruptible(1.0, self.state)
         finally:
+            print(
+                f"\n[统计] 本次运行结束汇总：高潮成功共 {self._runtime_total_cum_successes} 次；"
+                f"完成「5回合」实验 {self._runtime_total_five_round_experiments} 个（以各组第 5 次成功高潮计）。"
+            )
             self._scroll_enabled = False
             self._clear_scroll_command()
             self._stop_scroll_worker()

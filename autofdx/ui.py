@@ -1,4 +1,5 @@
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 import ctypes
 from pathlib import Path
@@ -45,6 +46,8 @@ class CalibrationOverlay:
         self.last_xy = (0, 0)
         self.game_left = self.game_top = self.game_width = self.game_height = 0
         self.edge_threshold = 12
+        # 女/男进度条：与「敏感进度条」同宽同高、横坐标对齐，仅允许整体上下平移；见 open_for_item / clamp。
+        self._bar_lock = None
 
     @property
     def config(self):
@@ -175,6 +178,8 @@ class CalibrationOverlay:
         self.item_key = item_key
         self.item_label = item_label
         self.scroll_distance_var = None
+        # 女/男条锁定状态在下方按敏感进度条结果设置；未进入锁定时必须为 None。
+        self._bar_lock = None
 
         left, top, width, height = self.window_service.get_window_region()
         self.game_left, self.game_top, self.game_width, self.game_height = left, top, width, height
@@ -227,6 +232,50 @@ class CalibrationOverlay:
                 py = [int(p[1] * height) for p in part_points if isinstance(p, list) and len(p) == 2]
                 if len(px) == 7 and len(py) == 7:
                     self.rect = [min(px), min(py), max(px), max(py)]
+        elif item_key in ("bar_female", "bar_male"):
+            # 与「敏感进度条」完全同宽、同高、左右对齐；仅保留纵向位置由用户调整（整体上下平移）。
+            # 游戏布局自上而下：敏感(蓝) → 女(红) → 男(红)。首次打开时默认纵向错开，减少框到蓝条或与另一条重叠。
+            sr = self.config["calibration_rects"].get("sensitive_progress_bar")
+            done_sens = bool(self.config.get("calibration_done", {}).get("sensitive_progress_bar", False))
+            if isinstance(sr, (list, tuple)) and len(sr) == 4 and done_sens:
+                sx1 = int(sr[0] * width)
+                sy1 = int(sr[1] * height)
+                sx2 = int(sr[2] * width)
+                sy2 = int(sr[3] * height)
+                if sx1 > sx2:
+                    sx1, sx2 = sx2, sx1
+                if sy1 > sy2:
+                    sy1, sy2 = sy2, sy1
+                bar_h = max(2, sy2 - sy1)
+                if sx2 - sx1 >= 2 and bar_h >= 2:
+                    gap_px = max(4, int(height * 0.008))
+                    done_f = bool(done_map.get("bar_female", False))
+                    done_m = bool(done_map.get("bar_male", False))
+                    if item_key == "bar_female" and not done_f:
+                        ny1 = min(max(0, height - bar_h), sy2 + gap_px)
+                        ny2 = ny1 + bar_h
+                        self.rect = [sx1, ny1, sx2, ny2]
+                    elif item_key == "bar_male" and not done_m:
+                        frn = self.config["calibration_rects"].get("bar_female")
+                        if isinstance(frn, (list, tuple)) and len(frn) == 4 and done_f:
+                            fy1 = int(min(frn[1], frn[3]) * height)
+                            fy2 = int(max(frn[1], frn[3]) * height)
+                            ny1 = min(max(0, height - bar_h), fy2 + gap_px)
+                        else:
+                            # 尚未标定女条时，退化为敏感条下方第二格位置，避免与蓝条同高。
+                            ny1 = min(max(0, height - bar_h), sy2 + gap_px + bar_h + gap_px)
+                        ny2 = ny1 + bar_h
+                        self.rect = [sx1, ny1, sx2, ny2]
+                    else:
+                        ox1, oy1, ox2, oy2 = self.rect
+                        mid_y = (oy1 + oy2) / 2.0
+                        ny1 = int(round(mid_y - bar_h / 2.0))
+                        ny2 = ny1 + bar_h
+                        max_y1 = max(0, height - bar_h)
+                        ny1 = max(0, min(max_y1, ny1))
+                        ny2 = ny1 + bar_h
+                        self.rect = [sx1, ny1, sx2, ny2]
+                    self._bar_lock = {"x1": sx1, "x2": sx2, "h": bar_h}
 
         self.win = tk.Toplevel(self.root)
         self.win.title(f"标定: {item_label}")
@@ -270,6 +319,9 @@ class CalibrationOverlay:
             tip_text = "左键拖动/缩放矩形，自动生成12点网格"
         elif self._is_body_part_item():
             tip_text = "左键拖动/缩放矩形，自动生成单行7个中心点"
+        elif self._bar_lock is not None:
+            # 女/男条：禁止改宽高与水平位置，避免与敏感条采样区域不一致。
+            tip_text = "左键拖动整框上下平移（宽/高/横坐标与敏感进度条一致）"
         else:
             tip_text = "左键拖动/缩放"
         tk.Label(panel, text=f"正在标定：{item_label}（{tip_text}）", fg=FG_MAIN, bg=BG_SUBCARD).pack(
@@ -284,7 +336,10 @@ class CalibrationOverlay:
         panel_y = 10
         rx1, ry1, rx2, ry2 = self.rect
         overlap_x = not (panel_x + panel_w < rx1 or panel_x > rx2)
-        overlap_y = not (panel_y + panel_h < ry1 or panel_y > ry2)
+        # 画布上的名称标签可能画在框体上方，检测重叠时把框顶向上虚拟扩展一段，避免控制条挡住标签区。
+        label_reserve_top = 36
+        expanded_top = max(0, ry1 - label_reserve_top)
+        overlap_y = not (panel_y + panel_h < expanded_top or panel_y > ry2)
         if overlap_x and overlap_y and (not self._is_pull_new_experiment_scroll_item()):
             panel_y = max(10, self.game_height - panel_h - 10)
             panel.place_configure(x=panel_x, y=panel_y)
@@ -303,18 +358,60 @@ class CalibrationOverlay:
         self.state.manual_pause = True
         self.state.set_status(f"标定中: {item_label}")
 
+    def _rects_overlap(self, a, b):
+        """两轴对齐矩形是否相交（含贴边视为不相交，避免零宽条误判）。"""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        return not (ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1)
+
     def _draw_label_outside(self, target_rect, text):
         """
         将标签绘制在目标框/点位外侧，避免遮挡边框或定位点。
-        优先放在目标上方；若空间不足则放在下方。
+        使用字体测量计算包围盒，在多个候选位置中选取与 target_rect 不相交且尽量在窗口内的一处。
         """
         x1, y1, x2, y2 = target_rect
-        top_y = y1 - 24
-        if top_y >= 4:
-            tx, ty = x1, top_y
+        gw, gh = self.game_width, self.game_height
+        font_ui = ("Microsoft YaHei UI", 11, "bold")
+        fobj = tkfont.Font(family="Microsoft YaHei UI", size=11, weight="bold")
+        tw = int(fobj.measure(text))
+        th = max(14, int(fobj.metrics("linespace")))
+        margin = 8
+
+        def bbox_nw(tx, ty):
+            return (tx, ty, tx + tw, ty + th)
+
+        def ok_pos(tx, ty):
+            bb = bbox_nw(tx, ty)
+            if self._rects_overlap(bb, target_rect):
+                return False
+            # 允许轻微贴边，整块尽量留在游戏窗口内。
+            pad = 2
+            if bb[0] < -pad or bb[1] < -pad or bb[2] > gw + pad or bb[3] > gh + pad:
+                return False
+            return True
+
+        cx = (x1 + x2 - tw) / 2.0
+        candidates = [
+            (cx, y1 - th - margin),
+            (cx, y2 + margin),
+            (x1 - tw - margin, (y1 + y2 - th) / 2.0),
+            (x2 + margin, (y1 + y2 - th) / 2.0),
+            (float(x1), y1 - th - margin),
+            (float(x1), y2 + margin),
+        ]
+        tx, ty = float(x1), float(max(4, y1 - th - margin))
+        for cand in candidates:
+            ctx, cty = cand
+            if ok_pos(ctx, cty):
+                tx, ty = ctx, cty
+                break
         else:
-            tx = x1
-            ty = min(max(4, y2 + 8), self.game_height - 24)
+            # 兜底：贴游戏窗口左上角或右上角文字区，仍尽量避免盖住标定框。
+            for try_tx, try_ty in ((4.0, 4.0), (max(4.0, gw - tw - 4), 4.0), (4.0, max(4.0, gh - th - 4))):
+                if ok_pos(try_tx, try_ty):
+                    tx, ty = try_tx, try_ty
+                    break
+
         # 先画深色描边，再画亮色正文，提升复杂背景上的可读性。
         self.canvas.create_text(
             tx + 1,
@@ -322,7 +419,7 @@ class CalibrationOverlay:
             anchor="nw",
             text=text,
             fill="#111827",
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=font_ui,
         )
         self.canvas.create_text(
             tx,
@@ -330,7 +427,7 @@ class CalibrationOverlay:
             anchor="nw",
             text=text,
             fill="#ffe066",
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=font_ui,
         )
 
     def redraw(self):
@@ -400,6 +497,17 @@ class CalibrationOverlay:
             self.rect = [px - 1, py - 1, px + 1, py + 1]
             return
 
+        if self._bar_lock is not None:
+            # 女/男条：宽高与左右与敏感条一致，仅钳制纵向平移。
+            h = int(self._bar_lock["h"])
+            x1 = int(self._bar_lock["x1"])
+            x2 = int(self._bar_lock["x2"])
+            y1 = int(self.rect[1])
+            y1 = max(0, min(self.game_height - h, y1))
+            y2 = y1 + h
+            self.rect = [x1, y1, x2, y2]
+            return
+
         x1, y1, x2, y2 = self.rect
         x1 = max(0, min(self.game_width - 2, x1))
         y1 = max(0, min(self.game_height - 2, y1))
@@ -413,6 +521,12 @@ class CalibrationOverlay:
 
     def get_drag_mode(self, x, y):
         x1, y1, x2, y2 = self.rect
+        if self._bar_lock is not None:
+            # 仅允许框内拖动整体上下平移，不提供边角缩放（尺寸由敏感条决定）。
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return "move"
+            return None
+
         t = self.edge_threshold
         near_left = abs(x - x1) <= t
         near_right = abs(x - x2) <= t
@@ -468,6 +582,16 @@ class CalibrationOverlay:
         dx, dy = event.x - self.last_xy[0], event.y - self.last_xy[1]
         x1, y1, x2, y2 = self.rect
 
+        if self._bar_lock is not None and self.drag_mode == "move":
+            # 忽略水平位移，避免误触导致框体漂移（左右已锁定）。
+            h = int(self._bar_lock["h"])
+            y1 += dy
+            self.rect = [int(self._bar_lock["x1"]), y1, int(self._bar_lock["x2"]), y1 + h]
+            self.last_xy = (event.x, event.y)
+            self.clamp()
+            self.redraw()
+            return
+
         if self.drag_mode == "move":
             self.rect = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
         else:
@@ -491,6 +615,10 @@ class CalibrationOverlay:
     def on_motion(self, event):
         if self._is_point_mode_item():
             self.canvas.configure(cursor="crosshair")
+            return
+
+        if self._bar_lock is not None:
+            self.canvas.configure(cursor="sb_v_double_arrow" if self.get_drag_mode(event.x, event.y) else "arrow")
             return
 
         mode = self.get_drag_mode(event.x, event.y)
@@ -521,6 +649,46 @@ class CalibrationOverlay:
         except Exception:
             value = 0.0
         return max(0.0, value)
+
+    def _print_bar_stack_layout_hints_after_save(self, item_key, norm):
+        """
+        游戏内自上而下为：敏感进度条(蓝) → 女进度条(红) → 男进度条(红)。
+        若归一化矩形纵向与其它条严重交叠，运行时红色掩膜会读到错误行，表现为「总是一侧条偏高」。
+        此处仅打印提示，不修改用户坐标。
+        """
+        eps = 0.005
+        rects = self.config.get("calibration_rects", {})
+        done = self.config.get("calibration_done", {})
+
+        def bottom(nr):
+            return max(float(nr[1]), float(nr[3]))
+
+        def top(nr):
+            return min(float(nr[1]), float(nr[3]))
+
+        s = rects.get("sensitive_progress_bar")
+        if item_key == "bar_female" and done.get("sensitive_progress_bar") and isinstance(s, (list, tuple)) and len(s) == 4:
+            if top(norm) < bottom(s) - eps:
+                print(
+                    "\n[标定提示] 女进度条顶边高于敏感条底边，框选可能与蓝条区域重叠；"
+                    "红蓝混合会使识别异常。请将女条框在第二根红色条上（紧贴敏感条下方）。"
+                )
+        if item_key == "bar_male":
+            f = rects.get("bar_female")
+            if done.get("bar_female") and isinstance(f, (list, tuple)) and len(f) == 4:
+                if top(norm) < bottom(f) - eps:
+                    print(
+                        "\n[标定提示] 男进度条顶边高于女进度条底边，可能与女条重叠。"
+                        "请把男条框在最下方红条上。"
+                    )
+        if item_key == "bar_female":
+            m = rects.get("bar_male")
+            if done.get("bar_male") and isinstance(m, (list, tuple)) and len(m) == 4:
+                if bottom(norm) > top(m) + eps:
+                    print(
+                        "\n[标定提示] 女进度条底边低于已保存的男进度条顶边，女/男上下顺序可能反了或两条区域相交。"
+                        "请确认女在上、男在下。"
+                    )
 
     def save(self):
         x1, y1, x2, y2 = self.rect
@@ -579,7 +747,7 @@ class CalibrationOverlay:
                 cv2.imwrite(str(PROJECT_ROOT / rel_path), crop)
                 self.config["custom_templates"][self.item_key] = rel_path
                 self.config["template_regions"][self.item_key] = norm
-        # 女进度条：独立保存区域与颜色采样（仅用于进度条纠偏）。
+        # 女进度条：bar_regions 供 detect_bars 裁切；bar_profiles 仍写入备查（运行时女/男填充率已改用固定红色掩膜）。
         elif self.item_key == "bar_female":
             self.config["bar_regions"]["bar1"] = norm
             c1 = screenshot[y1:y2, x1:x2]
@@ -640,6 +808,9 @@ class CalibrationOverlay:
             cur_part = self.config.get("current_body_part", 1)
             if (not isinstance(cur_part, int)) or cur_part < 1 or cur_part > 7:
                 self.config["current_body_part"] = 1
+
+        if self.item_key in ("bar_female", "bar_male"):
+            self._print_bar_stack_layout_hints_after_save(self.item_key, norm)
 
         self.config["calibration_done"][self.item_key] = True
         self.config_store.save()
@@ -1139,10 +1310,17 @@ def launch_floating_window(config_store, state, window_service):
             root.after(10, fit_collapsed_height)
 
     def trigger_item(item_key):
+        # 女/男条依赖敏感条的宽高与水平位置，必须先完成敏感进度条标定。
+        done_map = config_store.data.get("calibration_done", {})
+        if item_key in ("bar_female", "bar_male") and not done_map.get("sensitive_progress_bar", False):
+            state.set_status("请先完成「敏感进度条」标定（女/男条将与其同宽同高并可上下平移）")
+            print("\n[标定] 请先完成「敏感进度条」标定，再标定女/男进度条。")
+            return
         state.pending_calibration = item_key
 
     def refresh_button_colors():
         done_map = config_store.data.get("calibration_done", {})
+        sens_ok = bool(done_map.get("sensitive_progress_bar", False))
         for key, _ in CALIBRATION_ITEMS:
             btn = calib_buttons[key]
             if done_map.get(key, False):
@@ -1153,6 +1331,9 @@ def launch_floating_window(config_store, state, window_service):
                 btn._normal_bg = BTN_DANGER
                 btn._hover_bg = "#dc2626"
                 btn.configure(bg=btn._normal_bg, fg="white", activebackground=btn._hover_bg)
+            # 未完成敏感条时禁止进入女/男条标定，避免与锁定规则冲突。
+            if key in ("bar_female", "bar_male"):
+                btn.configure(state=("normal" if sens_ok else "disabled"))
 
     def style_button(btn, normal_bg=BTN_BG, hover_bg=BTN_HOVER):
         btn._normal_bg = normal_bg
