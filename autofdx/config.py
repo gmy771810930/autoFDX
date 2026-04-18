@@ -16,6 +16,10 @@ CALIBRATION_ITEMS = [
     ("finish", "再来一次按钮"),
     ("experiment_selected_flag", "实验选定标志"),
     ("recover_stamina_button", "恢复体力按钮"),
+    # 自动补充体力专用：框1=体力不足时的图标；框2=独立「补充体力」按钮（勿与主流程「恢复体力按钮」混用）。
+    ("stamina_insufficient_icon", "体力不足图标"),
+    ("stamina_supplement_button", "体力补充按钮（独立）"),
+    ("use_gel_confirm", "使用凝胶确认"),
     ("sensitive_progress_bar", "敏感进度条"),
     ("special_action_button", "特殊动作按钮"),
     ("pull_new_experiment_scroll", "拉出新实验滚动"),
@@ -30,6 +34,8 @@ CALIBRATION_ITEMS = [
     ("like4", "点赞用户1"),
     ("like5", "点赞用户2"),
     ("like6", "点赞用户3"),
+    # 赞池：圆环（外接矩形标定内接圆），环宽由 like_pool_ring_width_ratio 相对短边调节。
+    ("like_pool", "赞池"),
 ]
 
 
@@ -53,8 +59,12 @@ def build_default_config():
             "cum_single": 0.95,
             "experiment_selected_flag": 0.95,
             "recover_stamina_button": 0.95,
+            "stamina_insufficient_icon": 0.95,
+            "stamina_supplement_button": 0.95,
             "sensitive_progress_bar": 0.95,
             "special_action_button": 0.95,
+            # 身体部位条：用于实验切换时检测「条是否消失」。
+            "body_part_switch": 0.95,
         },
         "template_search_margin": 40,
         "template_regions": {},
@@ -79,6 +89,11 @@ def build_default_config():
             "distance_down": 0.0,
         },
         "like_points": [],
+        # 赞池：外接归一化矩形；外圆为矩形内接圆，环宽沿径向 ≈ 比例 × min(宽,高)（圆环区域 = 两圆之间）。
+        "like_pool_ring_width_ratio": 0.14,
+        # 圆环内蓝色像素占比 ≥ 该阈值视为「赞池满」。
+        # 主模式：成功点击再来一次后检测一次；单高潮：主循环约每 5 秒检测。
+        "like_pool_blue_full_threshold": 0.90,
         # 实验切换网格（3x4，共 12 点）：
         # - experiment_points: 按“从左到右、从上到下”顺序存储 12 个点（归一化坐标）。
         # - current_experiment: 当前实验索引，采用 [行, 列]（1-based）表示。
@@ -100,6 +115,8 @@ def build_default_config():
         # False=沿用完整流程；
         # True=仅运行“开始 -> 单高潮按钮 -> 再来一次按钮”三按钮流程。
         "single_cum_mode_enabled": False,
+        # 自动补充体力：回合结束、点击「开始」前，若体力显示模板出现则点体力再点凝胶确认。
+        "auto_refill_stamina_enabled": False,
         # 叠加层模式开关（预留）：
         # False=常规悬浮窗；True=用户选择 DX Hook/Overlay 路径（实验项）。
         "overlay_dx_hook_enabled": False,
@@ -113,6 +130,12 @@ def build_default_config():
             "experiment_selected_flag": [0.03, 0.02, 0.10, 0.12],
             # 恢复体力按钮：模板匹配项，保存模板图与匹配区域。
             "recover_stamina_button": [0.82, 0.82, 0.96, 0.94],
+            # 体力不足图标：模板匹配，出现时表示需要走自动补充体力流程。
+            "stamina_insufficient_icon": [0.82, 0.70, 0.90, 0.78],
+            # 独立体力补充按钮：模板匹配，自动补体力时点击此处（非 recover_stamina_button）。
+            "stamina_supplement_button": [0.82, 0.62, 0.96, 0.70],
+            # 使用凝胶确认：单点（归一化存为零面积矩形中心）。
+            "use_gel_confirm": [0.50, 0.50, 0.50, 0.50],
             # 敏感进度条：用于检测红色占比变化。
             "sensitive_progress_bar": [0.40, 0.80, 0.72, 0.90],
             # 特殊动作按钮：用于检测红色占比并执行点击。
@@ -132,6 +155,7 @@ def build_default_config():
             "like4": [0.05, 0.36, 0.12, 0.41],
             "like5": [0.05, 0.43, 0.12, 0.48],
             "like6": [0.05, 0.50, 0.12, 0.55],
+            "like_pool": [0.40, 0.06, 0.60, 0.20],
         },
     }
 
@@ -191,6 +215,24 @@ class ConfigStore:
             self.data["calibration_done"]["bar_female"] = old_done
             self.data["calibration_done"]["bar_male"] = old_done
 
+        # 旧版单一「stamina_display」拆成「体力不足图标」+「独立体力补充按钮」；迁移矩形/完成标记/模板路径。
+        if "stamina_display" in self.data["calibration_rects"]:
+            legacy_rect = self.data["calibration_rects"].pop("stamina_display")
+            self.data["calibration_rects"].setdefault("stamina_insufficient_icon", legacy_rect)
+        if "stamina_display" in self.data.get("calibration_done", {}):
+            legacy_done = bool(self.data["calibration_done"].pop("stamina_display"))
+            self.data["calibration_done"].setdefault("stamina_insufficient_icon", legacy_done)
+        ct = self.data.setdefault("custom_templates", {})
+        if "stamina_display" in ct:
+            ct.setdefault("stamina_insufficient_icon", ct.pop("stamina_display"))
+        tr = self.data.setdefault("template_regions", {})
+        if "stamina_display" in tr:
+            tr.setdefault("stamina_insufficient_icon", tr.pop("stamina_display"))
+        th = self.data.setdefault("template_thresholds", {})
+        if "stamina_display" in th:
+            th.setdefault("stamina_insufficient_icon", th.pop("stamina_display"))
+        th.setdefault("body_part_switch", 0.95)
+
         for key, _ in CALIBRATION_ITEMS:
             self.data["calibration_done"].setdefault(key, False)
             self.data["calibration_rects"].setdefault(key, defaults["calibration_rects"][key])
@@ -218,6 +260,9 @@ class ConfigStore:
         self.data.setdefault("experiment_switch_enabled", False)
         # 单高潮模式开关补默认值。
         self.data.setdefault("single_cum_mode_enabled", False)
+        self.data.setdefault("auto_refill_stamina_enabled", False)
+        self.data.setdefault("like_pool_ring_width_ratio", 0.14)
+        self.data.setdefault("like_pool_blue_full_threshold", 0.90)
         # 实验切换：补齐当前实验索引与 12 点网格数据。
         self.data.setdefault("current_experiment", [1, 1])
         self.data.setdefault("experiment_points", [])

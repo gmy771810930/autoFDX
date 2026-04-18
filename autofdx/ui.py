@@ -11,9 +11,30 @@ import pyautogui
 
 from .config import CALIBRATION_ITEMS
 from .config import PROJECT_ROOT
-from .vision_service import sample_hsv_profile
+from .vision_service import like_pool_annulus_radii, sample_hsv_profile
 
 BG_APP = "#0f172a"
+
+
+def _draw_like_pool_annulus_on_canvas(canvas, x1, y1, x2, y2, rw, outer_color="#00ff88", inner_color="#c084fc"):
+    """
+    按与 vision 相同的圆环几何，在画布上画外圆 + 内圆（紫虚线表示内边界）。
+    返回外接圆包围盒 [左,上,右,下]，供标签避让；几何无效时返回 None。
+    """
+    ax1, ax2 = min(x1, x2), max(x1, x2)
+    ay1, ay2 = min(y1, y2), max(y1, y2)
+    ow, oh = ax2 - ax1, ay2 - ay1
+    g = like_pool_annulus_radii(ow, oh, rw)
+    if g is None:
+        return None
+    cx, cy, rout, rin = g
+    cx_abs = ax1 + cx
+    cy_abs = ay1 + cy
+    canvas.create_oval(cx_abs - rout, cy_abs - rout, cx_abs + rout, cy_abs + rout, outline=outer_color, width=3)
+    canvas.create_oval(cx_abs - rin, cy_abs - rin, cx_abs + rin, cy_abs + rin, outline=inner_color, width=2, dash=(5, 4))
+    return [cx_abs - rout, cy_abs - rout, cx_abs + rout, cy_abs + rout]
+
+
 BG_CARD = "#111827"
 BG_SUBCARD = "#1f2937"
 FG_MAIN = "#e5e7eb"
@@ -42,6 +63,8 @@ class CalibrationOverlay:
         self.point_radius = 8
         # “拉出新实验滚动”专用输入：向下滚动距离（步数）。
         self.scroll_distance_var = None
+        # 「赞池」专用：环宽比例滑块（与 like_pool_ring_width_ratio 同步）。
+        self.ring_width_var = None
         self.drag_mode = None
         self.last_xy = (0, 0)
         self.game_left = self.game_top = self.game_width = self.game_height = 0
@@ -57,18 +80,31 @@ class CalibrationOverlay:
         return self.win is not None and self.win.winfo_exists()
 
     def _is_like_item(self):
-        return bool(self.item_key and self.item_key.startswith("like"))
+        # like_pool 为圆环区域（外接矩形标定），不走点赞圆点模式。
+        return bool(self.item_key and self.item_key.startswith("like") and self.item_key != "like_pool")
+
+    def _is_like_pool_item(self):
+        return self.item_key == "like_pool"
 
     def _is_pull_new_experiment_scroll_item(self):
         return self.item_key == "pull_new_experiment_scroll"
+
+    def _is_use_gel_confirm_item(self):
+        """「使用凝胶确认」：仅单点坐标，与点赞点位模式一致。"""
+        return self.item_key == "use_gel_confirm"
 
     def _is_point_mode_item(self):
         """
         点位模式项：
         - 点赞项：只标定点击点
         - 拉出新实验滚动：标定滚轮执行点
+        - 使用凝胶确认：单点点击位
         """
-        return self._is_like_item() or self._is_pull_new_experiment_scroll_item()
+        return (
+            self._is_like_item()
+            or self._is_pull_new_experiment_scroll_item()
+            or self._is_use_gel_confirm_item()
+        )
 
     def _is_experiment_switch_item(self):
         return self.item_key == "experiment_switch"
@@ -160,6 +196,9 @@ class CalibrationOverlay:
             rw, rh = 0.45, 0.35
         elif self._is_body_part_item():
             rw, rh = 0.60, 0.16
+        elif self.item_key == "like_pool":
+            # 外接矩形默认略扁，便于包住圆形赞池 UI；外圆为矩形内接圆。
+            rw, rh = 0.24, 0.14
         else:
             rw, rh = 0.20, 0.14
 
@@ -178,6 +217,7 @@ class CalibrationOverlay:
         self.item_key = item_key
         self.item_label = item_label
         self.scroll_distance_var = None
+        self.ring_width_var = None
         # 女/男条锁定状态在下方按敏感进度条结果设置；未进入锁定时必须为 None。
         self._bar_lock = None
 
@@ -311,14 +351,40 @@ class CalibrationOverlay:
             tk.Label(panel, text="预览调试请按 F11", fg=FG_MAIN, bg=BG_SUBCARD).pack(side="left", padx=(4, 6))
             # 打开时默认聚焦到输入框，便于直接录入距离。
             entry.focus_set()
+        if self.item_key == "like_pool":
+            # 环宽与运行时 vision 统计共用同一比例字段；滑块实时刷新内孔预览。
+            try:
+                rw0 = float(self.config.get("like_pool_ring_width_ratio", 0.14))
+            except Exception:
+                rw0 = 0.14
+            rw0 = max(0.05, min(0.45, rw0))
+            self.ring_width_var = tk.DoubleVar(value=rw0)
+            tk.Label(panel, text="环宽比例:", fg=FG_MAIN, bg=BG_SUBCARD).pack(side="left", padx=(8, 4))
+            tk.Scale(
+                panel,
+                from_=0.05,
+                to=0.45,
+                resolution=0.01,
+                orient="horizontal",
+                length=200,
+                variable=self.ring_width_var,
+                command=lambda _v: self.redraw(),
+                bg=BG_SUBCARD,
+                fg=FG_MAIN,
+                highlightthickness=0,
+            ).pack(side="left", padx=(0, 8))
         if self._is_like_item():
             tip_text = "左键点击/拖动圆点"
+        elif self._is_use_gel_confirm_item():
+            tip_text = "左键点击/拖动圆点，定位凝胶确认按钮"
         elif self._is_pull_new_experiment_scroll_item():
             tip_text = "左键定位执行点，填写向下滚动距离，按F11重播调试，回车保存"
         elif self._is_experiment_switch_item():
             tip_text = "左键拖动/缩放矩形，自动生成12点网格"
         elif self._is_body_part_item():
             tip_text = "左键拖动/缩放矩形，自动生成单行7个中心点"
+        elif self._is_like_pool_item():
+            tip_text = "拖动外接矩形；滑块调环宽（绿=外圆，紫虚线=内圆，圆环为采样区）"
         elif self._bar_lock is not None:
             # 女/男条：禁止改宽高与水平位置，避免与敏感条采样区域不一致。
             tip_text = "左键拖动整框上下平移（宽/高/横坐标与敏感进度条一致）"
@@ -481,6 +547,22 @@ class CalibrationOverlay:
                 )
             cur_part = int(self.config.get("current_body_part", 1))
             self._draw_label_outside([x1, y1, x2, y2], f"{self.item_label} 当前: {cur_part}")
+            return
+
+        if self._is_like_pool_item():
+            x1, y1, x2, y2 = self.rect
+            try:
+                rw = float(self.ring_width_var.get()) if self.ring_width_var is not None else float(
+                    self.config.get("like_pool_ring_width_ratio", 0.14)
+                )
+            except Exception:
+                rw = 0.14
+            bbox = _draw_like_pool_annulus_on_canvas(self.canvas, x1, y1, x2, y2, rw)
+            if bbox is None:
+                self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00ff88", width=3)
+                bbox = [x1, y1, x2, y2]
+            pct = int(round(max(0.05, min(0.45, rw)) * 100))
+            self._draw_label_outside(bbox, f"{self.item_label} 环宽比{pct}%")
             return
 
         x1, y1, x2, y2 = self.rect
@@ -703,6 +785,16 @@ class CalibrationOverlay:
             norm = [nx, ny, nx, ny]
         self.config["calibration_rects"][self.item_key] = norm
 
+        # 赞池：同步保存环宽比例（无模板截图）。
+        if self.item_key == "like_pool":
+            try:
+                rw_save = float(self.ring_width_var.get()) if self.ring_width_var is not None else float(
+                    self.config.get("like_pool_ring_width_ratio", 0.14)
+                )
+            except Exception:
+                rw_save = 0.14
+            self.config["like_pool_ring_width_ratio"] = max(0.05, min(0.45, rw_save))
+
         # 只有需要图像的标定项才截图；点赞点位和网格类标定仅保存坐标，不截图。
         need_screenshot = self.item_key in (
             "start",
@@ -711,10 +803,14 @@ class CalibrationOverlay:
             "finish",
             "experiment_selected_flag",
             "recover_stamina_button",
+            "stamina_insufficient_icon",
+            "stamina_supplement_button",
             "sensitive_progress_bar",
             "special_action_button",
             "bar_female",
             "bar_male",
+            # 身体部位：保存条带模板图，供「实验是否选定」时检测条是否消失。
+            "body_part_switch",
         )
         screenshot = None
         if need_screenshot:
@@ -739,8 +835,11 @@ class CalibrationOverlay:
             "finish",
             "experiment_selected_flag",
             "recover_stamina_button",
+            "stamina_insufficient_icon",
+            "stamina_supplement_button",
             "sensitive_progress_bar",
             "special_action_button",
+            "body_part_switch",
         ):
             crop = screenshot[y1:y2, x1:x2]
             if crop.size > 0:
@@ -766,7 +865,8 @@ class CalibrationOverlay:
                 self.config["bar_profiles"]["bar2"] = sample_hsv_profile(c2)
         elif self.item_key == "scroll_area":
             self.config["scroll_region"] = norm
-        elif self.item_key.startswith("like"):
+        elif self._is_like_item():
+            # like_pool 已在上文单独保存环宽，此处仅聚合 like1~like6 为 like_points。
             points = []
             for idx in range(1, 7):
                 rr = self.config["calibration_rects"][f"like{idx}"]
@@ -951,6 +1051,14 @@ class AllCalibrationOverlay:
             x2 = int(rect[2] * width)
             y2 = int(rect[3] * height)
             color = "#22c55e" if bool(done_map.get(key, False)) else "#ef4444"
+            if key == "like_pool":
+                rw_dbg = float(self.config.get("like_pool_ring_width_ratio", 0.14))
+                bbox = _draw_like_pool_annulus_on_canvas(self.canvas, x1, y1, x2, y2, rw_dbg, outer_color=color)
+                if bbox is None:
+                    self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=3)
+                    bbox = [x1, y1, x2, y2]
+                self._draw_label_outside(bbox, label, color)
+                continue
             self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=3)
             self._draw_label_outside([x1, y1, x2, y2], label, color)
         # 实验卡片点位（若存在）附加绘制
@@ -991,6 +1099,8 @@ def launch_floating_window(config_store, state, window_service):
     # 状态与控件布局收紧后，折叠态先给保守高度，启动后再按内容收紧（fit_collapsed_height）。
     win_h_expanded = 500
     win_h_collapsed = 260
+    # 标定子菜单已展开时，若同时展开「设置」面板，在固定展开高度上追加的像素（避免内容被裁切）。
+    win_h_settings_extra = 200
 
     def clamp_window_pos(req_h, px, py):
         """将窗口左上角约束在当前屏幕工作区内，保证整块窗口可见（含多显示器保存坐标拉回主屏）。"""
@@ -1049,6 +1159,7 @@ def launch_floating_window(config_store, state, window_service):
     experiment_switch_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("experiment_switch_enabled", False)))
     single_cum_mode_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("single_cum_mode_enabled", False)))
     overlay_dx_var = tk.BooleanVar(value=bool(config_store.data.get("overlay_dx_hook_enabled", False)))
+    auto_refill_stamina_var = tk.BooleanVar(value=bool(config_store.data.get("auto_refill_stamina_enabled", False)))
     overlay = CalibrationOverlay(root, config_store, state, window_service)
     all_overlay = AllCalibrationOverlay(root, config_store, state, window_service)
     selector_win = None
@@ -1172,6 +1283,17 @@ def launch_floating_window(config_store, state, window_service):
         # 约定：暂停中显示“继续”，运行中显示“暂停”。
         return "继续" if state.manual_pause else "暂停"
 
+    def _flow_text_for_status_line():
+        """
+        流程状态单行展示。单高潮等模式会频繁写入较长 current_status；
+        过长时截断并加省略号，避免状态 Label 换行过多把主按钮区挤出可视区域或挤没右侧勾选列。
+        """
+        s = str(state.current_status).replace("\n", " ").strip()
+        max_len = 72
+        if len(s) <= max_len:
+            return s
+        return s[: max_len - 1] + "…"
+
     def apply_pause_ui_text():
         run_var.set("已暂停" if state.manual_pause else "运行中")
         btn_pause.set_text(pause_button_text())
@@ -1180,7 +1302,7 @@ def launch_floating_window(config_store, state, window_service):
             btn_pause.set_style(normal_bg=BTN_SUCCESS, hover_bg="#2f8f4a", fg="white")
         else:
             btn_pause.set_style(normal_bg=BTN_DANGER, hover_bg="#dc2626", fg="white")
-        status_line_var.set(f"流程: {state.current_status}  |  状态: {run_var.get()}")
+        status_line_var.set(f"流程: {_flow_text_for_status_line()}  |  状态: {run_var.get()}")
 
     def toggle_pause():
         # 从“暂停->继续”前，先校验“实验切换”所需标定是否齐全。
@@ -1189,7 +1311,6 @@ def launch_floating_window(config_store, state, window_service):
             missing = []
             done_map = config_store.data.get("calibration_done", {})
             required = [
-                ("experiment_selected_flag", "实验选定标志"),
                 ("recover_stamina_button", "恢复体力按钮"),
                 ("experiment_switch", "实验卡片"),
                 ("body_part_switch", "身体部位"),
@@ -1209,6 +1330,7 @@ def launch_floating_window(config_store, state, window_service):
                 apply_pause_ui_text()
                 return
 
+        was_paused = state.manual_pause
         state.manual_pause = not state.manual_pause
         if state.manual_pause:
             state.set_status("手动暂停")
@@ -1217,6 +1339,9 @@ def launch_floating_window(config_store, state, window_service):
             if state.calibration_updated:
                 state.calibration_updated = False
                 state.set_status("使用新标定运行中")
+            # 从暂停恢复为运行：收起子页面，降低对游戏画面模板匹配的干扰。
+            if was_paused:
+                collapse_expanded_subpanels()
         apply_pause_ui_text()
 
     def on_exit():
@@ -1298,17 +1423,51 @@ def launch_floating_window(config_store, state, window_service):
         tk.Button(btn_row, text="确定", command=on_confirm, bg=ACCENT, fg="white", relief="flat").pack(side="right")
         selector_win.protocol("WM_DELETE_WINDOW", on_cancel)
 
+    # 设置面板容器：在下方 content_card 内实例化；此处先占位，避免高度同步函数在定义阶段引用未赋值。
+    settings_host = None
+
+    def _apply_shell_height():
+        """
+        根据「标定子菜单 / 设置面板」展开状态同步主窗口高度。
+        - 未展开标定菜单时：用内容实际请求高度（含设置面板），避免底部留白。
+        - 展开标定菜单时：使用固定展开高度，若设置面板同时展开则额外加一截。
+        """
+        nonlocal win_h_collapsed
+        if settings_host is None:
+            return
+        try:
+            sub_open = submenu_host.winfo_ismapped()
+            set_open = settings_host.winfo_ismapped()
+        except tk.TclError:
+            return
+        settings_extra = win_h_settings_extra if (sub_open and set_open) else 0
+        if sub_open:
+            nh = win_h_expanded + settings_extra
+        else:
+            root.update_idletasks()
+            nh = max(200, int(root.winfo_reqheight()))
+            win_h_collapsed = nh
+        cx, cy = clamp_window_pos(nh, root.winfo_x(), root.winfo_y())
+        root.geometry(f"{win_w}x{nh}+{cx}+{cy}")
+
+    def toggle_settings():
+        """展开/收起「设置」子区域（勾选与全屏兼容等）。"""
+        if settings_host is None:
+            return
+        if settings_host.winfo_ismapped():
+            settings_host.pack_forget()
+        else:
+            settings_host.pack(fill="x", pady=(4, 0))
+        _apply_shell_height()
+        if not submenu_host.winfo_ismapped():
+            root.after(10, fit_collapsed_height)
+
     def toggle_submenu():
         if submenu_host.winfo_ismapped():
             submenu_host.pack_forget()
-            nh = win_h_collapsed
         else:
             submenu_host.pack(fill="both", expand=True, pady=(4, 0))
-            nh = win_h_expanded
-        # 高度变化后重新夹紧，避免拉高后底边超出屏幕
-        cx, cy = clamp_window_pos(nh, root.winfo_x(), root.winfo_y())
-        root.geometry(f"{win_w}x{nh}+{cx}+{cy}")
-        # 收起标定菜单后再按实际内容收紧高度（fit_collapsed_height 在下方定义）
+        _apply_shell_height()
         if not submenu_host.winfo_ismapped():
             root.after(10, fit_collapsed_height)
 
@@ -1453,7 +1612,7 @@ def launch_floating_window(config_store, state, window_service):
         return holder
 
     def refresh_like_force_state():
-        # 仅在启用点赞功能时允许“立即执行点赞”勾选。
+        # 仅在启用点赞功能时允许「结束后强制点赞」勾选。
         force_state = "normal" if like_enabled_var.get() else "disabled"
         chk_like_force.configure(state=force_state)
         if not like_enabled_var.get():
@@ -1469,20 +1628,20 @@ def launch_floating_window(config_store, state, window_service):
         refresh_like_force_state()
 
     def on_like_force_next_toggle():
-        # 关闭点赞功能时不允许设置“立即执行点赞”。
+        # 关闭点赞功能时不允许设置强制点赞。
         if not like_enabled_var.get():
             like_force_next_var.set(False)
             return
         force_next = bool(like_force_next_var.get())
         config_store.data["like_force_next"] = force_next
-        # 仅记录“下一次流程结束立即点赞”意图。
+        # 记录「下一次主模式再来一次成功后强制点赞」意图（与赞池检测二选一优先消费此项）。
         # 点赞计数清零延后到“实际执行点赞后”再做，确保时序与业务一致。
         config_store.save()
 
     def refresh_feature_option_states():
         """
         单高潮模式开启时，仅禁用“实验切换”开关，避免配置语义冲突。
-        点赞功能保持可用（按业务规则在后台按 10 回合节奏触发）。
+        点赞开关仍可用；主模式为再来一次后赞池/强制点赞，单高潮为约 5 秒赞池轮询。
         """
         single_mode = bool(single_cum_mode_enabled_var.get())
         if single_mode:
@@ -1510,7 +1669,7 @@ def launch_floating_window(config_store, state, window_service):
         """
         单高潮模式开关：
         - 开启后仅保留“开始 -> 单高潮 -> 再来一次”流程；
-        - 点赞保持可用（该模式下后台按 10 回合节奏触发）；
+        - 点赞由赞池轮询判定（蓝占比满则 give，与再来一次无关），无计次点赞；
         - 实验切换必须关闭，防止后台误进入其他逻辑。
         """
         enabled = bool(single_cum_mode_enabled_var.get())
@@ -1519,7 +1678,7 @@ def launch_floating_window(config_store, state, window_service):
             # 为保证“只跑三按钮流程”，仅关闭实验切换能力。
             config_store.data["experiment_switch_enabled"] = False
             experiment_switch_enabled_var.set(False)
-            state.set_status("已启用单高潮模式（点赞按10回合触发）")
+            state.set_status("已启用单高潮模式（点赞仅赞池满时触发）")
         else:
             state.set_status("已关闭单高潮模式")
         config_store.save()
@@ -1535,6 +1694,16 @@ def launch_floating_window(config_store, state, window_service):
             state.set_status("已启用全屏模式兼容")
         else:
             state.set_status("已切换常规悬浮模式")
+
+    def on_auto_refill_stamina_toggle():
+        """持久化「自动补充体力」开关（需完成体力显示与凝胶确认标定后才会生效）。"""
+        enabled = bool(auto_refill_stamina_var.get())
+        config_store.data["auto_refill_stamina_enabled"] = enabled
+        config_store.save()
+        if enabled:
+            state.set_status("已开启自动补充体力（需标定：体力不足图标、独立补充按钮、凝胶确认）")
+        else:
+            state.set_status("已关闭自动补充体力")
 
     # 不再使用外层加粗描边框（用户反馈过宽）；内容区直接铺满根窗口。
     frame = tk.Frame(root, padx=10, pady=8, bg=BG_APP)
@@ -1556,14 +1725,6 @@ def launch_floating_window(config_store, state, window_service):
         font=("Microsoft YaHei UI", 9),
     )
     win_btn_host = tk.Frame(title_row, bg=HEADER_BAR_BG)
-    chk_overlay_dx = ttk.Checkbutton(
-        win_btn_host,
-        text="全屏模式兼容",
-        variable=overlay_dx_var,
-        command=on_overlay_dx_toggle,
-        style="Like.Header.TCheckbutton",
-        cursor="hand2",
-    )
     btn_win_pin = create_round_button(
         win_btn_host,
         text="固定中",
@@ -1587,8 +1748,7 @@ def launch_floating_window(config_store, state, window_service):
         radius=12,
         font=("Microsoft YaHei UI", 11, "bold"),
     )
-    # 先固定右侧控件组，再从左侧 pack，保证标题/提示与勾选、按钮在同一行内垂直居中对齐。
-    chk_overlay_dx.pack(side="left", padx=(0, 8), anchor="center")
+    # 先固定右侧控件组，再从左侧 pack，保证标题/提示与按钮在同一行内垂直居中对齐。
     for btn in (btn_win_pin, btn_win_close):
         btn.pack(side="left", padx=2, anchor="center")
     win_btn_host.pack(side="right", anchor="center")
@@ -1596,7 +1756,7 @@ def launch_floating_window(config_store, state, window_service):
     lbl_f1_hint.pack(side="left", padx=(10, 0), anchor="center")
     refresh_pin_button()
     # 自定义标题栏拖动窗口（标题栏整块可拖，避免误拖内容区）
-    for w in (title_bar, title_row, lbl_title, lbl_f1_hint, win_btn_host, chk_overlay_dx, btn_win_pin, btn_win_close):
+    for w in (title_bar, title_row, lbl_title, lbl_f1_hint, win_btn_host, btn_win_pin, btn_win_close):
         w.bind("<ButtonPress-1>", on_title_press)
         w.bind("<B1-Motion>", on_title_drag)
 
@@ -1615,13 +1775,17 @@ def launch_floating_window(config_store, state, window_service):
     # - 右列：勾选框
     content_grid = tk.Frame(content_card, bg=BG_CARD)
     content_grid.pack(fill="x")
+    # 右侧「结束后点赞」等控件保留最小宽度，避免长状态文案把该列挤成 0 宽不可见。
+    _right_col_minsize = 220
     content_grid.grid_columnconfigure(0, weight=1)
-    content_grid.grid_columnconfigure(1, weight=0)
+    content_grid.grid_columnconfigure(1, weight=0, minsize=_right_col_minsize)
     content_grid.grid_rowconfigure(0, weight=0)
     content_grid.grid_rowconfigure(1, weight=0)
 
     left_status_frame = tk.Frame(content_grid, bg=BG_CARD)
     left_status_frame.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
+    # 换行宽度 = 窗口宽 − 卡片边距 − 右侧列最小宽 − 列间距，避免 wrap 过宽占满整行挤压右列。
+    _status_wrap_px = max(200, int(win_w - 16 - _right_col_minsize - 24))
     status_text_label = tk.Label(
         left_status_frame,
         textvariable=status_line_var,
@@ -1630,8 +1794,7 @@ def launch_floating_window(config_store, state, window_service):
         font=("Microsoft YaHei UI", 10),
         anchor="w",
         justify="left",
-        # 左列预留给右侧勾选区，状态文本只在左列内换行。
-        wraplength=max(320, win_w - 360),
+        wraplength=_status_wrap_px,
     )
     # anchor=center：在父 Frame 行高大于标签内容时，整块状态文案在垂直方向居中（单行时无影响）。
     status_text_label.pack(fill="x", anchor="center")
@@ -1655,17 +1818,28 @@ def launch_floating_window(config_store, state, window_service):
         top_btn_frame,
         "自定义标定",
         toggle_submenu,
-        168,
+        140,
         42,
         BTN_BG,
         BTN_HOVER,
         radius=16,
         font=("Microsoft YaHei UI", 11, "bold"),
     )
-    # 原第三颗「退出脚本」已取消（标题栏 ✕ 关闭即可）；此处保留同尺寸占位，避免两键左移改变布局。
-    btn_exit_spacer = tk.Frame(top_btn_frame, width=168, height=42, bg=BG_CARD)
+    btn_settings = create_round_button(
+        top_btn_frame,
+        "设置",
+        toggle_settings,
+        100,
+        42,
+        BTN_BG,
+        BTN_HOVER,
+        radius=16,
+        font=("Microsoft YaHei UI", 11, "bold"),
+    )
+    # 原第三颗「退出脚本」已取消（标题栏 ✕ 关闭即可）；此处保留占位，避免按钮左移改变布局。
+    btn_exit_spacer = tk.Frame(top_btn_frame, width=120, height=42, bg=BG_CARD)
     btn_exit_spacer.pack_propagate(False)
-    for btn in (btn_pause, btn_menu):
+    for btn in (btn_pause, btn_menu, btn_settings):
         btn.pack(side="left", padx=4, anchor="center")
     btn_exit_spacer.pack(side="left", padx=4, anchor="center")
 
@@ -1678,24 +1852,7 @@ def launch_floating_window(config_store, state, window_service):
     like_option_frame.grid_rowconfigure(2, weight=1)
     like_option_right = tk.Frame(like_option_frame, bg=BG_CARD)
     like_option_right.grid(row=1, column=0, sticky="w")
-    chk_like_enabled = ttk.Checkbutton(
-        like_option_right,
-        text="启用点赞功能",
-        variable=like_enabled_var,
-        command=on_like_enabled_toggle,
-        style="Like.Big.TCheckbutton",
-        cursor="hand2",
-    )
-    chk_like_enabled.pack(anchor="w", pady=(0, 2))
-    chk_experiment_switch = ttk.Checkbutton(
-        like_option_right,
-        text="启用实验切换",
-        variable=experiment_switch_enabled_var,
-        command=on_experiment_switch_toggle,
-        style="Like.Big.TCheckbutton",
-        cursor="hand2",
-    )
-    chk_experiment_switch.pack(anchor="w", pady=2)
+    # 主界面仅保留「结束后执行点赞」；其余勾选收进「设置」子页面。
     chk_like_force = ttk.Checkbutton(
         like_option_right,
         text="结束后执行点赞-F3",
@@ -1705,15 +1862,64 @@ def launch_floating_window(config_store, state, window_service):
         cursor="hand2",
     )
     chk_like_force.pack(anchor="w", pady=(2, 0))
+
+    # 「设置」：默认折叠，内含全屏兼容、点赞/实验/单高潮、自动补体力等开关。
+    settings_host = tk.LabelFrame(
+        content_card,
+        text="设置",
+        bg=BG_CARD,
+        fg=FG_MUTED,
+        font=("Microsoft YaHei UI", 9),
+        padx=6,
+        pady=4,
+    )
+    settings_inner = tk.Frame(settings_host, bg=BG_CARD)
+    settings_inner.pack(fill="x")
+    chk_overlay_dx = ttk.Checkbutton(
+        settings_inner,
+        text="全屏模式兼容",
+        variable=overlay_dx_var,
+        command=on_overlay_dx_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_overlay_dx.pack(anchor="w", pady=(0, 2))
+    chk_like_enabled = ttk.Checkbutton(
+        settings_inner,
+        text="启用点赞功能",
+        variable=like_enabled_var,
+        command=on_like_enabled_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_like_enabled.pack(anchor="w", pady=(0, 2))
+    chk_experiment_switch = ttk.Checkbutton(
+        settings_inner,
+        text="启用实验切换",
+        variable=experiment_switch_enabled_var,
+        command=on_experiment_switch_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_experiment_switch.pack(anchor="w", pady=2)
     chk_single_cum_mode = ttk.Checkbutton(
-        like_option_right,
+        settings_inner,
         text="单高潮模式（仅三按钮）",
         variable=single_cum_mode_enabled_var,
         command=on_single_cum_mode_toggle,
         style="Like.Big.TCheckbutton",
         cursor="hand2",
     )
-    chk_single_cum_mode.pack(anchor="w", pady=(2, 0))
+    chk_single_cum_mode.pack(anchor="w", pady=(0, 2))
+    chk_auto_refill_stamina = ttk.Checkbutton(
+        settings_inner,
+        text="自动补充体力",
+        variable=auto_refill_stamina_var,
+        command=on_auto_refill_stamina_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_auto_refill_stamina.pack(anchor="w", pady=(0, 0))
     refresh_feature_option_states()
 
     submenu_host = tk.Frame(frame, bg=BG_APP)
@@ -1788,6 +1994,26 @@ def launch_floating_window(config_store, state, window_service):
         cx, cy = clamp_window_pos(h, root.winfo_x(), root.winfo_y())
         root.geometry(f"{win_w}x{h}+{cx}+{cy}")
 
+    def collapse_expanded_subpanels():
+        """
+        继续运行或 F1 恢复后调用：收起「自定义标定」「设置」子区域，
+        关闭 F12 标定项选择窗与全屏标定叠加层，避免展开的 UI 遮挡游戏区域、影响模板匹配。
+        """
+        try:
+            if submenu_host.winfo_ismapped():
+                submenu_host.pack_forget()
+            if settings_host is not None and settings_host.winfo_ismapped():
+                settings_host.pack_forget()
+        except tk.TclError:
+            pass
+        if selector_win is not None and selector_win.winfo_exists():
+            close_selector_window(reset_phase=False)
+        if all_overlay.is_open():
+            all_overlay.close()
+        state.show_all_calibration_overlay = False
+        _apply_shell_height()
+        root.after(10, fit_collapsed_height)
+
     root.bind("<Configure>", on_root_configure, add="+")
     root.protocol("WM_DELETE_WINDOW", on_exit)
     apply_overlay_mode(force=True)
@@ -1800,11 +2026,15 @@ def launch_floating_window(config_store, state, window_service):
     root.after(80, fit_collapsed_height)
 
     def refresh():
-        status_var.set(f"流程: {state.current_status}")
+        status_var.set(f"流程: {_flow_text_for_status_line()}")
+        # F1 在键盘钩子线程里触发，必须在主线程里执行 Tk 的 pack/destroy。
+        if getattr(state, "collapse_subpanels_request", False):
+            state.collapse_subpanels_request = False
+            collapse_expanded_subpanels()
         apply_pause_ui_text()
         # 不再周期性强制置顶，避免和游戏窗口抢焦点。
         # 悬浮状态仅在按钮切换时生效。
-        # 与后台流程保持一致：若“立即执行点赞”已被消费，UI 勾选随之回收。
+        # 与后台流程保持一致：若强制点赞已被消费，UI 勾选随之回收。
         cfg_force = bool(config_store.data.get("like_force_next", False))
         if like_force_next_var.get() != cfg_force:
             like_force_next_var.set(cfg_force)
@@ -1821,6 +2051,9 @@ def launch_floating_window(config_store, state, window_service):
         if overlay_dx_var.get() != cfg_overlay_dx:
             overlay_dx_var.set(cfg_overlay_dx)
             apply_overlay_mode(force=True)
+        cfg_auto_refill = bool(config_store.data.get("auto_refill_stamina_enabled", False))
+        if auto_refill_stamina_var.get() != cfg_auto_refill:
+            auto_refill_stamina_var.set(cfg_auto_refill)
         refresh_feature_option_states()
         refresh_button_colors()
         if bool(getattr(state, "open_calibration_overlay_selector", False)):

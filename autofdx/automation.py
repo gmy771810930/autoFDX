@@ -1,5 +1,5 @@
 import threading
-from time import sleep, time
+from time import monotonic, sleep, time
 
 import keyboard
 import pyautogui
@@ -10,6 +10,8 @@ FEMALE_BAR_STALL_NO_INCREASE_SECONDS = 5.0
 FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC = 6.0
 # 主键盘按「1」触发特殊动作后：至少经过该秒数，才用「模板匹配」判定重新出现。
 SPECIAL_ACTION_REAPPEAR_DELAY_AFTER_ONE_SEC = 1.0
+# 单高潮模式：赞池蓝色占比检测最小间隔（秒），与「随时随地」轮询并存，避免高频截图。
+LIKE_POOL_POLL_INTERVAL_SINGLE_CUM_SEC = 5.0
 
 
 def _sleep_interruptible(total_sec, state, step_sec=0.05):
@@ -115,6 +117,10 @@ class AutomationEngine:
         # 与用户手操或特殊动作恢复流程叠加时易误触，导致主循环异常中断（例如特殊动作日志刚打印后崩溃）。
         # 自动化场景关闭 failsafe；紧急停止仍依赖 F1 暂停与悬浮窗「退出脚本」。
         pyautogui.FAILSAFE = False
+        # 单高潮·赞池轮询：上次检测时刻（monotonic）；None 表示尚未检测过。
+        self._like_pool_poll_last_mono = None
+        # 边沿：蓝占比先低于阈值后再涨满才触发下一轮 give，避免长时间满池时每 5 秒重复点赞。
+        self._like_pool_armed_single_cum = True
 
     def _special_action_should_abort(self):
         """
@@ -149,109 +155,175 @@ class AutomationEngine:
     def _single_cum_mode_enabled(self):
         """
         单高潮模式开关：
-        True 时仅运行“开始 -> 单高潮 -> 再来一次”三按钮流程。
+        True 时为无阶段顺序的模板轮询：常规高潮与单高潮同屏时优先常规高潮，再单高潮，再开始、再来一次；
+        不含条带纠偏/特殊动作/女条停滞。
         """
         return bool(self.config_store.data.get("single_cum_mode_enabled", False))
 
-    def _like_round_interval(self):
+    def _maybe_like_after_finish_main(self):
         """
-        点赞轮次间隔：
-        - 常规模式：5 回合一次；
-        - 单高潮模式：10 回合一次。
+        【主模式】loop_once：每次成功点击「再来一次」后调用一次（单高潮早退不会进入）。
+        - 若 like_force_next：整轮 give() 并清除标记（F3/UI「结束后强制点赞」）；
+        - 否则若赞池已标定：检测圆环蓝占比一次，≥ 阈值则 give()。
         """
-        return 10 if self._single_cum_mode_enabled() else 5
+        if self._single_cum_mode_enabled():
+            return
+        if not bool(self.config_store.data.get("like_enabled", True)):
+            return
 
-    def _handle_like_after_finish(self):
-        """
-        结束按钮点击成功后的点赞处理：
-        - 累计回合计数；
-        - 按当前模式的轮次间隔触发点赞；
-        - 保留“立即执行点赞（一次性）”语义。
-        """
-        with self.state.lock:
-            self.state.like_cycle_count += 1
-
-        like_enabled = bool(self.config_store.data.get("like_enabled", True))
-        force_next_like = bool(self.config_store.data.get("like_force_next", False))
-        like_interval = max(1, int(self._like_round_interval()))
-        should_like = like_enabled and (force_next_like or (self.state.like_cycle_count % like_interval == 0))
-        if should_like:
+        if bool(self.config_store.data.get("like_force_next", False)):
+            self.state.log("主模式：like_force_next 强制点赞")
+            self.state.set_status("主模式：立即点赞（一次性）")
+            print("\n[点赞] 主模式：like_force_next 触发 give()")
             self.actions.give()
-            # 立即执行点赞为一次性触发：消费后自动清除并持久化。
-            if force_next_like:
-                # 只有“本次流程结束后实际调起点赞”时才清零计数，
-                # 从而保证下一次点赞仍需完整轮次。
-                with self.state.lock:
-                    self.state.like_cycle_count = 0
-                self.config_store.data["like_force_next"] = False
-                self.config_store.save()
+            self.config_store.data["like_force_next"] = False
+            self.config_store.save()
+            return
+
+        if not bool(self.config_store.data.get("calibration_done", {}).get("like_pool")):
+            return
+        pts = self.config_store.data.get("like_points", [])
+        if not isinstance(pts, list) or len(pts) < 6:
+            return
+
+        ratio = self.vision_service.like_pool_blue_fill_ratio()
+        if ratio is None:
+            return
+        th = float(self.config_store.data.get("like_pool_blue_full_threshold", 0.90))
+        if ratio < th:
+            return
+
+        msg = f"赞池已满：蓝占比 {ratio:.1%} ≥ 阈值 {th:.1%}，执行点赞（主模式·再来一次后）"
+        print(f"\n[赞池] {msg}")
+        self.state.log(msg)
+        self.state.set_status(f"赞池已满(蓝占比约{ratio:.0%})：执行点赞")
+        self.actions.give()
+
+    def _poll_like_pool_single_cum(self):
+        """
+        单高潮专用：主循环内「随时」轮询赞池（与 finish 时序无关），两次截图检测至少相隔
+        LIKE_POOL_POLL_INTERVAL_SINGLE_CUM_SEC 秒。蓝占比 ≥ 阈值时调起 give()。
+
+        边沿：仅当「先低于阈值再涨满」时给一轮赞，避免 UI 长期满池时每 5 秒重复执行整套 give()。
+        主流程 loop_once 不调用。
+        """
+        if not self._single_cum_mode_enabled():
+            return
+        if not bool(self.config_store.data.get("like_enabled", True)):
+            return
+        if not bool(self.config_store.data.get("calibration_done", {}).get("like_pool")):
+            return
+        pts = self.config_store.data.get("like_points", [])
+        if not isinstance(pts, list) or len(pts) < 6:
+            return
+
+        now = monotonic()
+        if self._like_pool_poll_last_mono is not None:
+            if now - self._like_pool_poll_last_mono < LIKE_POOL_POLL_INTERVAL_SINGLE_CUM_SEC:
+                return
+        self._like_pool_poll_last_mono = now
+
+        ratio = self.vision_service.like_pool_blue_fill_ratio()
+        if ratio is None:
+            return
+        th = float(self.config_store.data.get("like_pool_blue_full_threshold", 0.90))
+        if ratio < th:
+            self._like_pool_armed_single_cum = True
+            return
+        if not self._like_pool_armed_single_cum:
+            return
+        self._like_pool_armed_single_cum = False
+
+        msg = f"赞池已满：蓝占比 {ratio:.1%} ≥ 阈值 {th:.1%}，执行点赞"
+        print(f"\n[赞池] {msg}")
+        self.state.log(msg)
+        self.state.set_status(f"赞池已满(蓝占比约{ratio:.0%})：执行点赞")
+        self.actions.give()
 
     def _run_single_cum_mode_once(self):
         """
-        单高潮模式最小流程（不启用其他功能）：
-        1) 等待并点击开始按钮；
-        2) 等待并点击单高潮按钮（cum_single）；
-        3) 等待并点击再来一次按钮。
+        单高潮模式（轻量、无固定阶段顺序）：
+        - 同一轮内循环检测可点模板；若常规高潮与单高潮同时匹配，**优先点击常规高潮**（cum），再考虑单高潮。
+        - 其次「开始」、最后「再来一次」（点中再来一次则结束本轮）；点赞由主循环内赞池轮询触发，无计次点赞。
+        - 不做进度条纠偏、特殊动作、女条停滞。
+        - 首次检测到「开始」出现时执行一次自动补体力（与主流程相同），避免每帧重复触发。
         """
-        # 强制关闭与该模式无关的并行能力，避免“误触发其他逻辑”。
         self._scroll_enabled = False
         self._clear_scroll_command()
         self._female_bar_monitor_active = False
         self._special_action_monitor_active = False
 
-        while not self.actions.ready_to_start():
-            if self._wait_if_paused_or_interrupted():
-                return
-            self.state.log("单高潮模式：等待开始")
-            sleep(0.2)
+        # 仅在本轮第一次匹配到「开始」时做补体力 + 等「开始」再出现，避免在轮询里反复执行。
+        did_prefill_before_start = False
+        self._like_pool_poll_last_mono = None
+        self._like_pool_armed_single_cum = True
 
-        while self.actions.ready_to_start():
+        while not self.state.stop_requested:
             if self._wait_if_paused_or_interrupted():
                 return
-            clicked = self.actions.start()
-            if not clicked:
-                self.state.log("单高潮模式：开始按钮点击未确认，重试")
+
+            # 赞池：任意阶段均可检测（5 秒节流），不依赖 finish。
+            self._poll_like_pool_single_cum()
+
+            if not did_prefill_before_start and self.actions.ready_to_start():
+                self._maybe_auto_refill_stamina_before_start()
+                if self._wait_until_start_visible_again("单高潮模式：等待开始"):
+                    return
+                did_prefill_before_start = True
+
+            if self._wait_if_paused_or_interrupted():
+                return
+
+            # 同屏多种按钮可见时的优先级：
+            # 1) 常规高潮（cum2 等）与单高潮同时出现时，必须先点常规高潮（仅用 if/elif，不会先走 cum_single）；
+            # 2) 再「开始」；3) 最后「再来一次」（减少误点结束）。
+            if self.actions.ready_to_cum():
+                clicked = self.actions.cum()
+                if clicked:
+                    self.state.log("单高潮模式：点击高潮")
+                    self._runtime_total_cum_successes += 1
+                    self._print_runtime_experiment_stats()
+                else:
+                    self.state.log("单高潮模式：高潮按钮点击未确认，重试")
+                    sleep(0.12)
+                sleep(0.1)
+                continue
+
+            if self.actions.ready_to_cum_single():
+                clicked = self.actions.cum_single()
+                if clicked:
+                    self.state.log("单高潮模式：点击单高潮")
+                    self._runtime_total_cum_successes += 1
+                    self._print_runtime_experiment_stats()
+                else:
+                    self.state.log("单高潮模式：单高潮按钮点击未确认，重试")
+                    sleep(0.12)
+                sleep(0.1)
+                continue
+
+            if self.actions.ready_to_start():
+                clicked = self.actions.start()
+                if clicked:
+                    self.state.log("单高潮模式：点击开始")
+                    x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
+                    pyautogui.moveTo(x, y)
+                else:
+                    self.state.log("单高潮模式：开始按钮点击未确认，重试")
+                    sleep(0.12)
+                sleep(0.2)
+                continue
+
+            if self.actions.ready_to_finish():
+                clicked = self.actions.finish()
+                if clicked:
+                    self.state.log("单高潮模式：点击再来一次")
+                    return
+                self.state.log("单高潮模式：再来一次按钮点击未确认，重试")
                 sleep(0.12)
                 continue
-            self.state.log("单高潮模式：点击开始")
-            x, y = self.window_service.denormalize_point(self.config_store.data.get("safe_move_point", [0.95, 0.92]))
-            pyautogui.moveTo(x, y)
+
+            self.state.log("单高潮模式：等待可匹配按钮")
             sleep(0.2)
-
-        while not self.actions.ready_to_cum_single():
-            if self._wait_if_paused_or_interrupted():
-                return
-            self.state.log("单高潮模式：等待单高潮")
-            sleep(0.2)
-
-        while self.actions.ready_to_cum_single():
-            if self._wait_if_paused_or_interrupted():
-                return
-            clicked = self.actions.cum_single()
-            if not clicked:
-                self.state.log("单高潮模式：单高潮按钮点击未确认，重试")
-                self.actions.wait(0.12)
-                continue
-            self.state.log("单高潮模式：点击单高潮")
-            self.actions.wait(0.1)
-
-        while not self.actions.ready_to_finish():
-            if self._wait_if_paused_or_interrupted():
-                return
-            self.state.log("单高潮模式：等待再来一次")
-            self.actions.wait(0.2)
-
-        while self.actions.ready_to_finish():
-            if self._wait_if_paused_or_interrupted():
-                return
-            clicked = self.actions.finish()
-            if not clicked:
-                self.state.log("单高潮模式：再来一次按钮点击未确认，重试")
-                self.actions.wait(0.12)
-                continue
-            self.state.log("单高潮模式：点击再来一次")
-            self.actions.wait(0.2)
-            self._handle_like_after_finish()
 
     def _read_card_index_from_config(self):
         """
@@ -287,8 +359,8 @@ class AutomationEngine:
         """
         done_map = self.config_store.data.get("calibration_done", {})
         missing = []
+        # 实验是否选定：运行时以「身体部位条是否消失」判定，不再依赖 experiment_selected_flag 模板。
         required_flags = (
-            "experiment_selected_flag",
             "recover_stamina_button",
             "experiment_switch",
             "body_part_switch",
@@ -322,10 +394,10 @@ class AutomationEngine:
 
     def _retry_experiment_panel_and_click_same_card(self, card_index_1based):
         """
-        当「点击实验卡片后未出现实验选定标志」时，不一定是卡槽用尽：
+        当「点击实验卡片后身体部位条仍未消失」时，不一定是卡槽用尽：
         常见为界面未就绪、动画偏慢、模板瞬时未匹配。
         本函数：ESC 关闭 → 再按 E 打开面板 → 稍等后再次点击同一张卡片。
-        返回 True 表示再次点击已执行（不保证标志出现）。
+        返回 True 表示再次点击已执行（不保证身体部位条已消失）。
         """
         pyautogui.press("esc")
         sleep(1.0)
@@ -394,12 +466,12 @@ class AutomationEngine:
                     self._experiment_card_index = 1
                     self._save_card_index_to_config(self._experiment_card_index)
                     continue
-                # 5号身体部位：12 张卡仍全部无法确认选定标志，视为本流程结束。
+                # 5号身体部位：12 张卡仍全部无法确认身体部位条消失，视为本流程结束。
                 self.state.manual_pause = True
                 self.state.set_status("全部实验已完成，程序暂停")
                 print(
-                    "\n[实验已用尽] 身体部位5号上 12 张卡片仍无法确认选定标志。"
-                    "若仍有可用实验，请检查「实验选定标志」标定或重试。"
+                    "\n[实验已用尽] 身体部位5号上 12 张卡片仍无法确认「身体部位条已消失」。"
+                    "若仍有可用实验，请检查「身体部位」模板标定或重试。"
                 )
                 return False
 
@@ -416,13 +488,13 @@ class AutomationEngine:
                 )
                 return False
 
-            # 流程.md 第3条：点击后检测「实验选定标志」。
-            # 原 2s 偏紧，且单次未匹配易被误判为「卡槽用尽」；拉长超时并允许重开面板再点同卡一次。
-            sel_flag_timeout_sec = 3.5
-            got_flag = self.actions.wait_experiment_selected_flag(timeout_sec=sel_flag_timeout_sec)
-            if not got_flag:
+            # 流程.md 第3条：点击后检测「身体部位条是否消失」（实验选定后该条通常收起/不可见）。
+            # 原 2s 偏紧；拉长超时并允许重开面板再点同卡一次。
+            sel_confirm_timeout_sec = 3.5
+            body_part_hidden = self.actions.wait_until_body_part_switch_hidden(timeout_sec=sel_confirm_timeout_sec)
+            if not body_part_hidden:
                 print(
-                    "\n[实验切换] 首次未在超时内检测到实验选定标志，"
+                    "\n[实验切换] 首次未在超时内检测到身体部位条消失，"
                     "将重开实验面板并再次点击同一张卡片（避免界面延迟/模板瞬时未匹配误判为已用尽）。"
                 )
                 if not self._retry_experiment_panel_and_click_same_card(self._experiment_card_index):
@@ -432,14 +504,14 @@ class AutomationEngine:
                         f"\n[实验切换] 已暂停：重试时实验卡片点位不可用，当前索引={self._experiment_card_index}。"
                     )
                     return False
-                got_flag = self.actions.wait_experiment_selected_flag(timeout_sec=sel_flag_timeout_sec)
+                body_part_hidden = self.actions.wait_until_body_part_switch_hidden(timeout_sec=sel_confirm_timeout_sec)
 
-            if not got_flag:
-                # 两次尝试后仍无标志：多数为当前卡槽在游戏内不可用，或「实验选定标志」标定/阈值需检查。
+            if not body_part_hidden:
+                # 两次尝试后身体部位条仍在：多数为当前卡槽不可用，或「身体部位」模板/阈值需检查。
                 if self._current_body_part_index != 5:
                     self.state.set_status("实验已用尽：切换到身体部位5号")
                     print(
-                        f"\n[实验已用尽] 卡片{self._experiment_card_index}号经两次检测仍无实验选定标志，"
+                        f"\n[实验已用尽] 卡片{self._experiment_card_index}号经两次检测身体部位条仍未消失，"
                         f"将假定当前身体部位该槽不可用，切换身体部位 {self._current_body_part_index}号→5号，重置实验点位为1。"
                     )
                     self.actions.click_body_part(2)
@@ -449,12 +521,12 @@ class AutomationEngine:
                     self._experiment_card_index = 1
                     self._save_card_index_to_config(self._experiment_card_index)
                     continue
-                # 5号身体部位仍失败：可能真已无可用实验，也可能是标志模板未稳定匹配。
+                # 5号身体部位仍失败：可能真已无可用实验，也可能是身体部位模板未稳定匹配。
                 self.state.manual_pause = True
                 self.state.set_status("全部实验已完成，程序暂停")
                 print(
-                    "\n[实验已用尽] 在身体部位5号上仍无法确认实验选定标志。"
-                    "若你确认仍有可用实验，请检查「实验选定标志」标定与模板匹配阈值，或适当提高游戏帧率/关闭遮挡。"
+                    "\n[实验已用尽] 在身体部位5号上仍无法确认身体部位条消失。"
+                    "若你确认仍有可用实验，请检查「身体部位」模板标定与匹配阈值，或适当提高游戏帧率/关闭遮挡。"
                 )
                 return False
 
@@ -485,48 +557,28 @@ class AutomationEngine:
                 sleep(1.0)
                 continue
 
-            # ── 流程.md 第5条：开始按钮未出现 → 尝试【移动视角部署】最多 5 次 ──
-            # 注意：每一次“移动视角”后都立即执行一次“左键部署 + 开始按钮判断 + 恢复体力按钮判断”。
+            # ── 流程.md 第5条：开始按钮未出现 →【移动视角部署】5 秒内连续移动视角并左键 ──
             if not start_seen:
-                for retry_idx in range(1, 6):
-                    if self.state.stop_requested or self.state.pending_calibration is not None:
-                        return False
-                    if self._wait_if_paused_or_interrupted():
-                        return False
-                    print(f"\n[移动视角部署] 第{retry_idx}/5 次尝试...")
-                    self.state.set_status(f"移动视角部署 ({retry_idx}/5)")
-                    self.actions.move_camera_right_sendinput()
-                    # 按流程要求：每次移动后等待 0.5s 稳定，再尝试部署。
-                    sleep(0.5)
-                    print(f"\n[移动视角部署] 第{retry_idx}/5 次：移动完成，立即左键尝试部署。")
-                    start_seen, both_ready = self.actions.deploy_and_check_start_recover(timeout_sec=2.0)
-                    if both_ready:
-                        print(f"\n[移动视角部署] 第{retry_idx}/5 次成功：开始按钮与恢复体力按钮均通过。")
-                        # 部署成功后先等待 1s，再进入正常运行阶段。
-                        sleep(1.0)
-                        self._experiment_switch_bootstrapped = True
-                        self._experiment_cycle_count = 0
-                        self.state.set_status("实验切换完成")
-                        print(f"\n[实验切换] 部署成功：实验卡片索引={self._experiment_card_index}。")
-                        return True
-                    if start_seen:
-                        # 规则：恢复体力按钮不存在 -> 直接切换下一实验，不继续重试。
-                        print(
-                            f"\n[移动视角部署] 第{retry_idx}/5 次失败：开始按钮已出现但恢复体力按钮不存在，"
-                            "直接进入【切换下一实验】。"
-                        )
-                        self._experiment_card_index += 1
-                        pyautogui.press("esc")
-                        sleep(1.0)
-                        self.actions.press_experiment_switch_hotkey()
-                        sleep(1.0)
-                        break
-                    print(f"\n[移动视角部署] 第{retry_idx}/5 次失败。")
-                else:
-                    # 5 次移动视角均失败（开始按钮始终未出现）→ 【切换下一实验】。
+                if self.state.stop_requested or self.state.pending_calibration is not None:
+                    return False
+                if self._wait_if_paused_or_interrupted():
+                    return False
+                print("\n[移动视角部署] 开始：5 秒内连续移动视角并左键...")
+                self.state.set_status("移动视角部署（5秒连续）")
+                mv_start_seen, mv_both = self.actions.move_camera_burst_deploy_check(duration_sec=5.0)
+                if mv_both:
+                    print("\n[移动视角部署] 成功：开始按钮与恢复体力按钮均通过。")
+                    sleep(1.0)
+                    self._experiment_switch_bootstrapped = True
+                    self._experiment_cycle_count = 0
+                    self.state.set_status("实验切换完成")
+                    print(f"\n[实验切换] 部署成功：实验卡片索引={self._experiment_card_index}。")
+                    return True
+                if mv_start_seen:
+                    # 规则：恢复体力按钮不存在 -> 直接切换下一实验。
                     print(
-                        f"\n[实验切换] 部署全部失败：索引={self._experiment_card_index}，"
-                        "顺延到下一卡片并进入【切换下一实验】。"
+                        "\n[移动视角部署] 失败：开始按钮已出现但恢复体力按钮不存在，"
+                        "直接进入【切换下一实验】。"
                     )
                     self._experiment_card_index += 1
                     pyautogui.press("esc")
@@ -534,8 +586,16 @@ class AutomationEngine:
                     self.actions.press_experiment_switch_hotkey()
                     sleep(1.0)
                     continue
-
-                # 走到这里代表“恢复体力按钮缺失”分支已提前执行切换。
+                # 5 秒内始终未出现开始按钮（或未达到双条件）→ 【切换下一实验】。
+                print(
+                    f"\n[实验切换] 部署全部失败：索引={self._experiment_card_index}，"
+                    "顺延到下一卡片并进入【切换下一实验】。"
+                )
+                self._experiment_card_index += 1
+                pyautogui.press("esc")
+                sleep(1.0)
+                self.actions.press_experiment_switch_hotkey()
+                sleep(1.0)
                 continue
 
         return False
@@ -602,6 +662,8 @@ class AutomationEngine:
             self.state.set_status("F1紧急暂停")
             print("\n[F1] 已暂停自动流程。")
         else:
+            # 主线程里收起展开的子页面，避免遮挡游戏区域、影响模板匹配。
+            self.state.collapse_subpanels_request = True
             # 若此前由 F2 声明了“恢复后立即切换下一实验”，
             # 则恢复状态文案要明确提示“下一步会先切换”，避免用户误判脚本会先继续当前实验。
             if self._f2_pending_switch_after_resume:
@@ -632,6 +694,69 @@ class AutomationEngine:
             return True
         return False
 
+    def _maybe_auto_refill_stamina_before_start(self):
+        """
+        自动补充体力：在「开始」按钮已出现、尚未点击前执行。
+        1) 若「体力不足图标」可匹配，表示需要补充；
+        2) 点击「体力补充按钮（独立）」模板中心（勿用主流程的 recover_stamina_button）；
+        3) 延时 1s 后点击「使用凝胶确认」标定点。
+        依赖标定：stamina_insufficient_icon、stamina_supplement_button（均为模板）、use_gel_confirm（单点）。
+        """
+        if not bool(self.config_store.data.get("auto_refill_stamina_enabled", False)):
+            return
+        if self._wait_if_paused_or_interrupted():
+            return
+        done = self.config_store.data.get("calibration_done", {})
+        if not (
+            bool(done.get("stamina_insufficient_icon"))
+            and bool(done.get("stamina_supplement_button"))
+            and bool(done.get("use_gel_confirm"))
+        ):
+            return
+        try:
+            if self.vision_service.match("stamina_insufficient_icon") is None:
+                return
+        except FileNotFoundError:
+            return
+        try:
+            supplement_pos = self.vision_service.match("stamina_supplement_button")
+        except FileNotFoundError:
+            return
+        if supplement_pos is None:
+            self.state.set_status("自动补充体力：已检测到体力不足，但未匹配到独立补充按钮")
+            return
+        self.state.set_status("自动补充体力：点击独立补充按钮并确认凝胶")
+        pyautogui.moveTo(supplement_pos[0], supplement_pos[1])
+        sleep(0.12)
+        pyautogui.leftClick()
+        t_end = time() + 1.0
+        while time() < t_end:
+            if self._wait_if_paused_or_interrupted():
+                return
+            sleep(min(0.08, t_end - time()))
+        rect = self.config_store.data.get("calibration_rects", {}).get("use_gel_confirm")
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            return
+        nx = (float(rect[0]) + float(rect[2])) / 2.0
+        ny = (float(rect[1]) + float(rect[3])) / 2.0
+        x, y = self.window_service.denormalize_point([nx, ny])
+        pyautogui.moveTo(x, y)
+        sleep(0.08)
+        pyautogui.leftClick()
+
+    def _wait_until_start_visible_again(self, log_message="等待开始"):
+        """
+        自动补体力、凝胶确认等操作后，「开始」按钮常会短暂不匹配或不在画面上；
+        若紧接着进入「while ready_to_start 点击开始」，可能因当前帧已无开始模板而整段循环不执行。
+        因此补体力后必须重新轮询，直到「开始」再次出现再点。
+        """
+        while not self.actions.ready_to_start():
+            if self._wait_if_paused_or_interrupted():
+                return True
+            self.state.log(log_message)
+            sleep(0.2)
+        return False
+
     def _pause_and_switch_next_experiment_by_f2(self):
         """
         F2 快捷操作（新规则）：
@@ -654,12 +779,12 @@ class AutomationEngine:
     def _toggle_like_force_next_by_f3(self):
         """
         F3 快捷操作：
-        - 切换“结束后执行点赞（一次性）”开关；
+        - 切换「结束后强制整轮点赞（一次性）」——主模式在成功点击再来一次后消费；
         - 与 UI 勾选保持同一配置项（like_force_next）。
         """
         like_enabled = bool(self.config_store.data.get("like_enabled", True))
         if not like_enabled:
-            # 点赞功能关闭时，不允许置位“结束后执行点赞”，避免出现看不见的无效状态。
+            # 点赞功能关闭时，不允许置位强制点赞，避免出现看不见的无效状态。
             if bool(self.config_store.data.get("like_force_next", False)):
                 self.config_store.data["like_force_next"] = False
                 self.config_store.save()
@@ -671,11 +796,11 @@ class AutomationEngine:
         self.config_store.data["like_force_next"] = next_value
         self.config_store.save()
         if next_value:
-            self.state.set_status("F3已开启：结束后执行点赞")
-            print("\n[F3] 已开启：结束后执行点赞（一次性）。")
+            self.state.set_status("F3已开启：结束后强制点赞")
+            print("\n[F3] 已开启：再来一次成功后强制点赞（一次性）。")
         else:
-            self.state.set_status("F3已关闭：结束后执行点赞")
-            print("\n[F3] 已关闭：结束后执行点赞。")
+            self.state.set_status("F3已关闭：结束后强制点赞")
+            print("\n[F3] 已关闭：再来一次成功后强制点赞。")
 
     def _toggle_all_calibration_overlay_by_f12(self):
         """
@@ -723,13 +848,56 @@ class AutomationEngine:
         """F11 调试：随时重播“拉出新实验滚动”标定动作。"""
         self.actions.replay_pull_new_experiment_scroll_action(delay_sec=1.0)
 
+    def _esc_until_recover_stamina_button_hidden(self):
+        """
+        F2→F1 时首次 ESC 已用于「退出当前实验」之后调用。
+
+        若画面上仍能模板匹配到主流程的「恢复体力按钮」（recover_stamina_button），
+        说明仍停留在需继续按 ESC 逐层返回的界面；先短暂延迟再判图，然后循环 ESC，
+        直至该按钮不再出现——视为已回到脚本认知中的「大厅/列表」侧，再继续后续按 E 等步骤。
+
+        注意：此处不使用「体力补充按钮（独立）」stamina_supplement_button，与自动补体力那条链路区分。
+
+        未标定该模板或缺少模板文件时静默跳过，不阻塞切换流程。
+        """
+        done = self.config_store.data.get("calibration_done", {})
+        if not bool(done.get("recover_stamina_button")):
+            return
+        # 给界面动画/叠层一拍时间，避免首帧误判。
+        sleep(0.45)
+        max_extra_esc = 60
+        for round_idx in range(max_extra_esc):
+            if self.state.stop_requested or self.state.pending_calibration is not None:
+                return
+            if self.state.manual_pause:
+                return
+            try:
+                still = self.vision_service.match("recover_stamina_button") is not None
+            except FileNotFoundError:
+                return
+            if not still:
+                if round_idx > 0:
+                    print("\n[F2切换] 「恢复体力按钮」已消失，视为已回到大厅侧。")
+                return
+            if round_idx == 0:
+                print(
+                    "\n[F2切换] 首次 ESC 后仍可见「恢复体力按钮」，将间歇按 ESC 直至其消失。"
+                )
+            self.state.set_status("F2切换：ESC 返回中（恢复体力按钮仍可见）")
+            pyautogui.press("esc")
+            sleep(0.38)
+
+        print(
+            f"\n[F2切换] 警告：已额外 ESC {max_extra_esc} 次后「恢复体力按钮」仍可见，继续后续切换。"
+        )
+
     def _switch_next_experiment_after_f2_resume(self):
         """
         仅用于 F2 场景下“恢复后立即切换下一实验”：
         - 实验卡片顺延一次；
         - 实验计数清零；
         - 不等待 2s，直接执行【切换下一实验】定义动作：
-          ESC -> 延迟 1000ms -> E -> 等待 1s；
+          ESC ->（若恢复体力按钮仍可见则间歇 ESC 直至消失）-> 延迟 1000ms -> E -> 等待 1s；
         - 标记面板已预开，避免 bootstrap 重复按 E。
         """
         self._experiment_cycle_count = 0
@@ -737,6 +905,8 @@ class AutomationEngine:
         self._experiment_switch_bootstrapped = False
         self.state.set_status("F2恢复后：切换下一实验")
         pyautogui.press("esc")
+        # 首次 ESC 后若仍卡在带「恢复体力按钮」的界面，继续 ESC 直到回到大厅认知态。
+        self._esc_until_recover_stamina_button_hidden()
         sleep(1.0)
         self.actions.press_experiment_switch_hotkey()
         sleep(1.0)
@@ -1041,10 +1211,12 @@ class AutomationEngine:
             pass
 
     def loop_once(self):
-        # 单高潮模式优先级最高：开启后仅保留“开始/单高潮/再来一次”三按钮流程。
+        # 单高潮模式优先级最高：开启后仅保留“开始/单高潮/再来一次”三按钮流程（赞池轮询仅在其中生效）。
         if self._single_cum_mode_enabled():
             self._run_single_cum_mode_once()
             return
+
+        # —— 以下为【主模式】loop_once：点赞在成功点击「再来一次」后由 _maybe_like_after_finish_main() 处理。 ——
 
         experiment_switch_enabled = bool(self.config_store.data.get("experiment_switch_enabled", False))
         # F2 一次性“恢复后切换”入口：
@@ -1109,7 +1281,7 @@ class AutomationEngine:
                     self._experiment_panel_preopened = True
                 else:
                     # 流程.md 【切换下一实验】（点位号≠12）：
-                    # 点赞流程已在 loop_once 末尾的 give() 调用中完成；此处直接执行切换。
+                    # 点赞已在每轮回合结束（再来一次后）处理；此处直接执行切换。
                     self.state.set_status("实验5次完成，执行切换实验")
                     print(f"\n[实验切换] 点位号={self._experiment_card_index}，执行【切换下一实验】。")
                     self._experiment_card_index += 1
@@ -1133,6 +1305,11 @@ class AutomationEngine:
                 return
             self.state.log("等待开始")
             sleep(0.2)
+
+        # 回合结束后再进关：此时「开始」已出现；若开启自动补体力且检测到体力提示，则先处理再点「开始」。
+        self._maybe_auto_refill_stamina_before_start()
+        if self._wait_until_start_visible_again():
+            return
 
         while self.actions.ready_to_start():
             if self._wait_if_paused_or_interrupted():
@@ -1293,11 +1470,12 @@ class AutomationEngine:
                 continue
             self.state.log("点击结束")
             self.actions.wait(0.2)
-            self._handle_like_after_finish()
+            # 主模式：再来一次成功后检测赞池一次（或消费 like_force_next）。
+            self._maybe_like_after_finish_main()
 
             # 新规则（按流程文档）：
             # 在实验切换模式下，正常运行满 5 回合后，
-            # 先按“原有逻辑”处理点赞，再等待“开始按钮出现后 2s”执行切换。
+            # 先处理点赞，再等待“开始按钮出现后 2s”执行切换。
             if experiment_switch_enabled:
                 self._experiment_cycle_count += 1
                 if self._experiment_cycle_count >= 5:

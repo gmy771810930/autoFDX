@@ -327,19 +327,38 @@ class GameActions:
 
     def has_experiment_selected_flag(self):
         """
-        检测“实验选定标志”是否出现。
-        该标志用于区分“卡片可选中”与“实验已用尽”等分支。
+        检测「实验选定标志」模板是否出现（遗留项，实验切换/bootstrap 已改用语义见 has_body_part_switch_visible）。
         """
         return self.vision_service.match("experiment_selected_flag") is not None
 
     def wait_experiment_selected_flag(self, timeout_sec=0.5, poll_interval_sec=0.06):
-        """
-        在给定超时时间内轮询“实验选定标志”是否出现。
-        默认超时 500ms，满足你提出的时序要求。
-        """
+        """遗留：轮询实验选定标志是否出现。新流程请用 wait_until_body_part_switch_hidden。"""
         deadline = monotonic() + max(0.0, float(timeout_sec))
         while monotonic() < deadline:
             if self.has_experiment_selected_flag():
+                return True
+            sleep(max(0.01, float(poll_interval_sec)))
+        return False
+
+    def has_body_part_switch_visible(self):
+        """
+        身体部位条是否仍可见（依赖「身体部位」标定矩形内的模板匹配）。
+        实验面板打开时通常为可见；选定实验并关闭/收起该条后视为不可见。
+        无模板文件时返回 True，避免误判为「已消失」导致假阳性（最终会超时由上层处理）。
+        """
+        try:
+            return self.vision_service.match("body_part_switch") is not None
+        except FileNotFoundError:
+            return True
+
+    def wait_until_body_part_switch_hidden(self, timeout_sec=3.5, poll_interval_sec=0.06):
+        """
+        在给定超时内轮询，直至身体部位条不再匹配到模板（视为实验已选定/界面已切换）。
+        返回 True 表示在超时前已消失；False 表示超时仍未消失。
+        """
+        deadline = monotonic() + max(0.0, float(timeout_sec))
+        while monotonic() < deadline:
+            if not self.has_body_part_switch_visible():
                 return True
             sleep(max(0.01, float(poll_interval_sec)))
         return False
@@ -377,6 +396,128 @@ class GameActions:
         # 移动完成后短暂稳定，避免游戏来不及响应
         sleep(0.1)
         print(f"\n[移动视角] SendInput 向右移动 {total_dx}px（屏幕宽 {screen_w} 的 1/10）。")
+
+    def _rotation_target_dx_360(self):
+        """
+        估算「约一整圈水平视角」所需的累积相对位移（SendInput 像素，与 pyautogui 逻辑坐标一致）。
+
+        说明：
+        - 游戏内灵敏度未知，这里用「逻辑屏宽」与「系统 DPI」做下限标定，使不同 Windows 显示缩放下
+          总行程接近「在 96 DPI 设计下拖过一整屏宽度」的量级，避免高分屏/缩放只移了半圈。
+        - 公式：max(屏宽, 屏宽 × DPI/96)，高 DPI 时逻辑宽度往往变小，乘系数补足。
+        """
+        screen_w, _ = pyautogui.size()
+        dpi = 96
+        if sys.platform == "win32":
+            try:
+                dpi = int(ctypes.windll.user32.GetDpiForSystem())
+            except Exception:
+                dpi = 96
+        dpi = max(72, min(384, dpi))
+        return max(int(screen_w), int(screen_w * (dpi / 96.0)))
+
+    def move_camera_burst_deploy_check(self, duration_sec=5.0, poll_interval_sec=0.06):
+        """
+        【移动视角部署】在整段 duration_sec 内**同时**进行：
+        - 鼠标相对屏幕**匀速、连续向右移动**（按时间积分位移，观感平滑；总行程≈_rotation_target_dx_360()，约一整圈+DPI 适配）；
+        - **不间断**左键点击尝试部署（固定间隔，避免过快被系统/游戏吞掉）。
+
+        主循环高频刷新位移（loop_tick_sec），模板检测按 poll_interval_sec 节流。
+        口径与 deploy_and_check_start_recover 一致。
+
+        返回 (start_seen, both_ready)：
+        - both_ready=True：已可同时检测到开始+恢复体力；
+        - start_seen=True 且 both_ready=False：曾出现开始但未同时满足恢复体力；
+        - start_seen=False：整个窗口内未稳定出现开始按钮。
+        """
+        ws = max(0.5, float(duration_sec))
+        screen_w, _ = pyautogui.size()
+        rotation_target_dx = self._rotation_target_dx_360()
+        # 匀速：整段窗口内平均角速度，使结束时累积位移≈一整圈标定值。
+        velocity_px_per_sec = float(rotation_target_dx) / ws
+        # 单次 SendInput 位移上限，拆段注入，避免单帧过大。
+        max_chunk = 512
+        # 主循环节拍：位移按「已过时间」追赶目标，节拍越细观感越平滑。
+        loop_tick_sec = 0.006
+        # 左键间隔：略大于 0 即视为「不停点」，过密可能被合并为一次。
+        click_interval_sec = 0.065
+
+        outer_deadline = monotonic() + ws
+        loop_start = monotonic()
+        cumulative_dx = 0
+        start_seen = False
+        dpi_show = 96
+        if sys.platform == "win32":
+            try:
+                dpi_show = int(ctypes.windll.user32.GetDpiForSystem())
+            except Exception:
+                dpi_show = 96
+        print(
+            f"\n[移动视角部署] {ws:.0f}s 平滑匀速右移 + 连续左键：目标总位移≈{rotation_target_dx}px"
+            f"（≈{velocity_px_per_sec:.1f}px/s，屏宽={screen_w}px，DPI≈{dpi_show}）。"
+        )
+
+        def _send_dx_total(dx: int) -> None:
+            """将 dx 拆成多段注入并累加到 cumulative_dx。"""
+            nonlocal cumulative_dx
+            left = int(dx)
+            while left > 0:
+                chunk = min(max_chunk, left)
+                _send_relative_move(chunk, 0)
+                cumulative_dx += chunk
+                left -= chunk
+
+        # 首拍即可点一次；之后按 click_interval_sec 重复。
+        last_click_t = loop_start - click_interval_sec
+        last_vision_t = loop_start - float(poll_interval_sec)
+
+        while monotonic() < outer_deadline:
+            if self.state.stop_requested:
+                print("\n[移动视角部署] 已请求停止，中断连续尝试。")
+                return start_seen, False
+
+            now = monotonic()
+            elapsed = max(0.0, now - loop_start)
+            # 平滑：当前时刻「应已移动」的整数像素，不超过整圈目标。
+            ideal_cumulative = min(float(rotation_target_dx), velocity_px_per_sec * elapsed)
+            target_int = min(rotation_target_dx, int(ideal_cumulative))
+            delta = target_int - cumulative_dx
+            if delta > 0:
+                _send_dx_total(delta)
+
+            if now - last_click_t >= click_interval_sec:
+                pyautogui.leftClick()
+                last_click_t = now
+
+            if now - last_vision_t >= float(poll_interval_sec):
+                last_vision_t = now
+                has_start = bool(self.ready_to_start())
+                try:
+                    has_recover = self.vision_service.match("recover_stamina_button") is not None
+                except Exception:
+                    has_recover = False
+                if has_start:
+                    start_seen = True
+                if has_start and has_recover:
+                    print("\n[移动视角部署] 连续尝试中已成功：开始按钮与恢复体力按钮均检测到。")
+                    return True, True
+
+            sleep(loop_tick_sec)
+
+        # 舍入误差收尾，尽量凑满整圈标定（不打断上面的提前成功返回）。
+        rem = rotation_target_dx - cumulative_dx
+        if rem > 0:
+            _send_dx_total(rem)
+        if cumulative_dx < rotation_target_dx:
+            print(
+                f"\n[移动视角部署] 警告：{ws:.0f}s 结束时累积位移 {cumulative_dx}px < 目标 {rotation_target_dx}px，"
+                "若视角仍不足一圈可适当提高游戏鼠标灵敏度或延长 duration_sec。"
+            )
+        if start_seen:
+            print(f"\n[移动视角部署] {ws:.0f}s 内出现过开始按钮，但恢复体力按钮未同时满足。")
+            return True, False
+        print(f"\n[移动视角部署] {ws:.0f}s 连续尝试结束：未检测到开始按钮。")
+        return False, False
 
     def has_recover_stamina_button(self, timeout_sec=2.0, poll_interval_sec=0.06):
         """

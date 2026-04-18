@@ -7,6 +7,29 @@ import pyautogui
 from .config import PROJECT_ROOT, TEMPLATES_DIR
 
 
+def like_pool_annulus_radii(ow, oh, rw):
+    """
+    赞池圆环几何（裁切区坐标，原点为外接矩形左上角）：
+    - 外圆：矩形 ow×oh 的内接圆；
+    - 环宽：沿径向，宽度 ≈ rw × min(ow,oh)（像素取整后与标定滑块一致）；
+    - 内圆：外圆半径减去环宽。
+    返回 (cx, cy, r_out, r_in)；无效时返回 None。
+    """
+    if ow < 4 or oh < 4:
+        return None
+    rw = max(0.05, min(0.45, float(rw)))
+    min_side = float(min(ow, oh))
+    cx = float(ow) * 0.5
+    cy = float(oh) * 0.5
+    r_out = min_side * 0.5
+    band = int(round(rw * min_side))
+    band = max(1, min(band, max(1, int(np.floor(r_out)) - 1)))
+    r_in = float(r_out) - float(band)
+    if r_in <= 1e-6 or r_in >= r_out:
+        return None
+    return cx, cy, float(r_out), r_in
+
+
 class VisionService:
     """负责模板匹配与进度条识别。"""
 
@@ -182,6 +205,69 @@ class VisionService:
             np.array(pyautogui.screenshot(region=self.window_service.get_window_region())),
             cv2.COLOR_RGB2BGR,
         )
+
+    def _build_ui_blue_mask_bgr(self, bgr_img):
+        """
+        游戏 UI 常见高亮蓝/青填充：宽松 HSV，用于赞池圆环内「蓝色占比」统计。
+        """
+        if bgr_img is None or bgr_img.size == 0:
+            return None
+        hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+        return cv2.inRange(hsv, np.array([85, 45, 40]), np.array([135, 255, 255]))
+
+    def like_pool_blue_fill_ratio(self):
+        """
+        赞池圆环区域（外圆与内圆之间）内蓝色像素占比，范围约 0~1。
+        未标定、区域无效或圆环退化时返回 None。
+
+        性能：只截取赞池「外接矩形」一块屏幕区域并做一次统计，不整窗截图。
+        调用频率由 automation 决定：主模式为每次再来一次成功后一次；单高潮为约每 5 秒一次轮询。
+        """
+        rects = self.config.get("calibration_rects", {})
+        outer = rects.get("like_pool")
+        if not isinstance(outer, (list, tuple)) or len(outer) != 4:
+            return None
+        rw = float(self.config.get("like_pool_ring_width_ratio", 0.14))
+        rw = max(0.05, min(0.45, rw))
+
+        left, top, w, h = self.window_service.get_window_region()
+        nx1, ny1, nx2, ny2 = outer
+        ox1 = int(min(nx1, nx2) * w)
+        oy1 = int(min(ny1, ny2) * h)
+        ox2 = int(max(nx1, nx2) * w)
+        oy2 = int(max(ny1, ny2) * h)
+        ox1, ox2 = max(0, ox1), min(w, ox2)
+        oy1, oy2 = max(0, oy1), min(h, oy2)
+        ow, oh = ox2 - ox1, oy2 - oy1
+        if ow < 4 or oh < 4:
+            return None
+
+        geo = like_pool_annulus_radii(ow, oh, rw)
+        if geo is None:
+            return None
+        cx, cy, r_out, r_in = geo
+
+        # 仅截取外接矩形（屏幕坐标），在裁切图上用距离场生成圆环掩膜。
+        try:
+            shot = pyautogui.screenshot(
+                region=(int(left + ox1), int(top + oy1), int(ow), int(oh))
+            )
+        except Exception:
+            return None
+        crop = cv2.cvtColor(np.asarray(shot), cv2.COLOR_RGB2BGR)
+        if crop.size == 0:
+            return None
+        yy, xx = np.ogrid[0:oh, 0:ow]
+        dist2 = (xx.astype(np.float64) - cx) ** 2 + (yy.astype(np.float64) - cy) ** 2
+        ring_mask = (dist2 > r_in * r_in) & (dist2 <= r_out * r_out + 1e-9)
+        blue = self._build_ui_blue_mask_bgr(crop)
+        if blue is None:
+            return None
+        ring_area = int(np.count_nonzero(ring_mask))
+        if ring_area <= 0:
+            return None
+        blue_in_ring = int(np.count_nonzero((blue > 0) & ring_mask))
+        return float(blue_in_ring) / float(ring_area)
 
     def _build_red_mask_bgr(self, bgr_img):
         """
