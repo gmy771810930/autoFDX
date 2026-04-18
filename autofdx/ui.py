@@ -707,6 +707,7 @@ class CalibrationOverlay:
         need_screenshot = self.item_key in (
             "start",
             "cum2",
+            "cum_single",
             "finish",
             "experiment_selected_flag",
             "recover_stamina_button",
@@ -734,6 +735,7 @@ class CalibrationOverlay:
         if self.item_key in (
             "start",
             "cum2",
+            "cum_single",
             "finish",
             "experiment_selected_flag",
             "recover_stamina_button",
@@ -1045,6 +1047,7 @@ def launch_floating_window(config_store, state, window_service):
     like_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("like_enabled", True)))
     like_force_next_var = tk.BooleanVar(value=bool(config_store.data.get("like_force_next", False)))
     experiment_switch_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("experiment_switch_enabled", False)))
+    single_cum_mode_enabled_var = tk.BooleanVar(value=bool(config_store.data.get("single_cum_mode_enabled", False)))
     overlay_dx_var = tk.BooleanVar(value=bool(config_store.data.get("overlay_dx_hook_enabled", False)))
     overlay = CalibrationOverlay(root, config_store, state, window_service)
     all_overlay = AllCalibrationOverlay(root, config_store, state, window_service)
@@ -1182,7 +1185,7 @@ def launch_floating_window(config_store, state, window_service):
     def toggle_pause():
         # 从“暂停->继续”前，先校验“实验切换”所需标定是否齐全。
         # 这样可确保开启实验切换后，不会在缺少关键点位时误运行。
-        if state.manual_pause and experiment_switch_enabled_var.get():
+        if state.manual_pause and experiment_switch_enabled_var.get() and (not single_cum_mode_enabled_var.get()):
             missing = []
             done_map = config_store.data.get("calibration_done", {})
             required = [
@@ -1476,6 +1479,19 @@ def launch_floating_window(config_store, state, window_service):
         # 点赞计数清零延后到“实际执行点赞后”再做，确保时序与业务一致。
         config_store.save()
 
+    def refresh_feature_option_states():
+        """
+        单高潮模式开启时，仅禁用“实验切换”开关，避免配置语义冲突。
+        点赞功能保持可用（按业务规则在后台按 10 回合节奏触发）。
+        """
+        single_mode = bool(single_cum_mode_enabled_var.get())
+        if single_mode:
+            chk_experiment_switch.configure(state="disabled")
+        else:
+            chk_experiment_switch.configure(state="normal")
+        chk_like_enabled.configure(state="normal")
+        refresh_like_force_state()
+
     def on_experiment_switch_toggle():
         """
         实验切换总开关：
@@ -1489,6 +1505,25 @@ def launch_floating_window(config_store, state, window_service):
             state.set_status("已启用实验切换（需先完成实验相关标定）")
         else:
             state.set_status("已关闭实验切换")
+
+    def on_single_cum_mode_toggle():
+        """
+        单高潮模式开关：
+        - 开启后仅保留“开始 -> 单高潮 -> 再来一次”流程；
+        - 点赞保持可用（该模式下后台按 10 回合节奏触发）；
+        - 实验切换必须关闭，防止后台误进入其他逻辑。
+        """
+        enabled = bool(single_cum_mode_enabled_var.get())
+        config_store.data["single_cum_mode_enabled"] = enabled
+        if enabled:
+            # 为保证“只跑三按钮流程”，仅关闭实验切换能力。
+            config_store.data["experiment_switch_enabled"] = False
+            experiment_switch_enabled_var.set(False)
+            state.set_status("已启用单高潮模式（点赞按10回合触发）")
+        else:
+            state.set_status("已关闭单高潮模式")
+        config_store.save()
+        refresh_feature_option_states()
 
     def on_overlay_dx_toggle():
         # 仅提供“用户可选”开关，便于后续接入 DX Hook/Overlay 实现。
@@ -1670,7 +1705,16 @@ def launch_floating_window(config_store, state, window_service):
         cursor="hand2",
     )
     chk_like_force.pack(anchor="w", pady=(2, 0))
-    refresh_like_force_state()
+    chk_single_cum_mode = ttk.Checkbutton(
+        like_option_right,
+        text="单高潮模式（仅三按钮）",
+        variable=single_cum_mode_enabled_var,
+        command=on_single_cum_mode_toggle,
+        style="Like.Big.TCheckbutton",
+        cursor="hand2",
+    )
+    chk_single_cum_mode.pack(anchor="w", pady=(2, 0))
+    refresh_feature_option_states()
 
     submenu_host = tk.Frame(frame, bg=BG_APP)
     # 使用“无可见滚动条”模式：避免滚动条占位影响可视区域，滚动靠鼠标滚轮完成。
@@ -1770,11 +1814,14 @@ def launch_floating_window(config_store, state, window_service):
         cfg_experiment_switch = bool(config_store.data.get("experiment_switch_enabled", False))
         if experiment_switch_enabled_var.get() != cfg_experiment_switch:
             experiment_switch_enabled_var.set(cfg_experiment_switch)
+        cfg_single_cum_mode = bool(config_store.data.get("single_cum_mode_enabled", False))
+        if single_cum_mode_enabled_var.get() != cfg_single_cum_mode:
+            single_cum_mode_enabled_var.set(cfg_single_cum_mode)
         cfg_overlay_dx = bool(config_store.data.get("overlay_dx_hook_enabled", False))
         if overlay_dx_var.get() != cfg_overlay_dx:
             overlay_dx_var.set(cfg_overlay_dx)
             apply_overlay_mode(force=True)
-        refresh_like_force_state()
+        refresh_feature_option_states()
         refresh_button_colors()
         if bool(getattr(state, "open_calibration_overlay_selector", False)):
             open_selector_window()

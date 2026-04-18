@@ -156,6 +156,12 @@ class GameActions:
     def ready_to_cum(self):
         return self.vision_service.match(f"cum{self.state.cum_mode}")
 
+    def ready_to_cum_single(self):
+        """
+        单高潮模式专用：检测“单高潮按钮（cum_single）”是否出现。
+        """
+        return self.vision_service.match("cum_single")
+
     def ready_to_finish(self):
         return self.vision_service.match("finish")
 
@@ -213,6 +219,28 @@ class GameActions:
 
     def cum(self):
         key = f"cum{self.state.cum_mode}"
+
+        def _click_once():
+            # 每次重试动态取点，兼容按钮动画抖动/轻微位移。
+            pos = self.vision_service.match(key)
+            if not pos:
+                return
+            pyautogui.moveTo(pos[0], pos[1])
+            self.wait(0.12)
+            # 略微拉开双击间隔，降低与游戏输入竞争导致的漏触发。
+            pyautogui.click(clicks=2, interval=0.08)
+            self.wait(0.08)
+            self._move_mouse_right_after_click(key)
+
+        return self._click_with_disappear_retry(key, _click_once)
+
+    def cum_single(self):
+        """
+        单高潮模式专用点击：
+        - 仅使用 cum_single 模板；
+        - 与常规高潮点击保持同样的双击节奏与去抖重试策略。
+        """
+        key = "cum_single"
 
         def _click_once():
             # 每次重试动态取点，兼容按钮动画抖动/轻微位移。
@@ -503,8 +531,24 @@ class GameActions:
         # 按最新规则：敏感进度条颜色为蓝色。
         return self._blue_fill_ratio(crop)
 
+    def is_special_action_button_present(self):
+        """
+        是否存在特殊动作按钮（仅模板匹配，不判颜色）：
+        - 用于「按钮已出现在画面上」类逻辑（开局等待、消失/再出现语义）；
+        - 与 is_special_action_button_red（可触发态）区分。
+        """
+        try:
+            return self.vision_service.match("special_action_button") is not None
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
     def is_special_action_button_red(self, threshold=0.60):
-        """判断“特殊动作按钮”是否进入红色态（红色占比 >= threshold）。"""
+        """
+        判断特殊动作按钮是否处于「可触发」的红色态（区域内红色占比 >= threshold）。
+        仅用于触发主键盘「1」的条件，不用于判断按钮是否在画面上存在。
+        """
         crop = self._capture_calibration_region_bgr("special_action_button")
         if crop is None:
             return False

@@ -12,6 +12,7 @@ TEMPLATES_DIR = ASSETS_DIR / "templates"
 CALIBRATION_ITEMS = [
     ("start", "开始按钮"),
     ("cum2", "高潮按钮"),
+    ("cum_single", "单高潮按钮"),
     ("finish", "再来一次按钮"),
     ("experiment_selected_flag", "实验选定标志"),
     ("recover_stamina_button", "恢复体力按钮"),
@@ -49,6 +50,7 @@ def build_default_config():
             "finish": 0.95,
             "cum1": 0.95,
             "cum2": 0.95,
+            "cum_single": 0.95,
             "experiment_selected_flag": 0.95,
             "recover_stamina_button": 0.95,
             "sensitive_progress_bar": 0.95,
@@ -94,6 +96,10 @@ def build_default_config():
         # 实验切换总开关：
         # False=沿用原有流程；True=运行前先执行“实验切换预处理流程”。
         "experiment_switch_enabled": False,
+        # 单高潮模式总开关：
+        # False=沿用完整流程；
+        # True=仅运行“开始 -> 单高潮按钮 -> 再来一次按钮”三按钮流程。
+        "single_cum_mode_enabled": False,
         # 叠加层模式开关（预留）：
         # False=常规悬浮窗；True=用户选择 DX Hook/Overlay 路径（实验项）。
         "overlay_dx_hook_enabled": False,
@@ -101,6 +107,7 @@ def build_default_config():
         "calibration_rects": {
             "start": [0.35, 0.82, 0.45, 0.89],
             "cum2": [0.45, 0.82, 0.55, 0.89],
+            "cum_single": [0.45, 0.82, 0.55, 0.89],
             "finish": [0.55, 0.82, 0.65, 0.89],
             # 实验选定标志：和开始按钮同类，保存模板图与匹配区域。
             "experiment_selected_flag": [0.03, 0.02, 0.10, 0.12],
@@ -209,6 +216,8 @@ class ConfigStore:
         self.data.setdefault("like_force_next", False)
         # 实验切换总开关补默认值。
         self.data.setdefault("experiment_switch_enabled", False)
+        # 单高潮模式开关补默认值。
+        self.data.setdefault("single_cum_mode_enabled", False)
         # 实验切换：补齐当前实验索引与 12 点网格数据。
         self.data.setdefault("current_experiment", [1, 1])
         self.data.setdefault("experiment_points", [])
