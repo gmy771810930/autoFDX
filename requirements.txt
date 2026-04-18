@@ -1,0 +1,4 @@
+# autoFDX — Python 依赖（单一来源：实际包列表在 tools/requirements.txt）
+# 安装：pip install -r requirements.txt
+# 说明：与 setup_windows.bat / tools/setup_windows.ps1 使用同一套依赖。
+-r tools/requirements.txt
