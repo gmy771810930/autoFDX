@@ -959,22 +959,32 @@ class AutomationEngine:
                 continue
             # 开局：开始按钮已点后，须先模板匹配到特殊动作按钮，再启动停滞计时（存在≠可触发红态）。
             if self._female_bar_stall_wait_special_visible_after_start:
-                try:
-                    if self.actions.is_special_action_button_present():
+                # 检查特殊按钮是否已标定
+                done_map = self.config_store.data.get("calibration_done", {})
+                if not done_map.get("special_action_button", False):
+                    # 未标定则直接跳过等待，启动停滞检测
+                    self._female_bar_stall_wait_special_visible_after_start = False
+                    self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
+                    print("\n[女进度条监测] 特殊动作按钮未标定，跳过等待，直接启动停滞检测。")
+                else:
+                    try:
+                        if self.actions.is_special_action_button_present():
+                            self._female_bar_stall_wait_special_visible_after_start = False
+                            self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
+                            print(
+                                f"\n[女进度条监测] 已检测到特殊动作按钮（模板），启动女进度条停滞检测；"
+                                f"宽限 {FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC:.0f}s 内不因未增长判停滞。"
+                            )
+                        else:
+                            baseline_b1 = None
+                            baseline_time = None
+                            sleep(0.1)
+                            continue
+                    except Exception:
+                        # 模板文件缺失也跳过等待
                         self._female_bar_stall_wait_special_visible_after_start = False
                         self._female_bar_stall_grace_until = time() + FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC
-                        print(
-                            f"\n[女进度条监测] 已检测到特殊动作按钮（模板），启动女进度条停滞检测；"
-                            f"宽限 {FEMALE_BAR_STALL_GRACE_AFTER_ARMING_SEC:.0f}s 内不因未增长判停滞。"
-                        )
-                    else:
-                        baseline_b1 = None
-                        baseline_time = None
-                        sleep(0.1)
-                        continue
-                except Exception:
-                    sleep(0.1)
-                    continue
+                        print("\n[女进度条监测] 特殊动作按钮模板缺失，跳过等待，直接启动停滞检测。")
             try:
                 screen = self.vision_service.capture_screen()
                 b1, _ = self.vision_service.detect_bars(screen)
@@ -1329,44 +1339,38 @@ class AutomationEngine:
         # “点击开始后~点击高潮前”阶段：
         # 若发生女进度条停滞，则按新规则执行恢复，并在恢复后继续留在当前实验。
         while True:
-            # 每轮“等待高潮”前重置平滑状态，避免停滞恢复后沿用旧轮次数据。
             next_balance_check_at = time()
             bar_fill_ema_b1 = None
             bar_fill_ema_b2 = None
-            # 流程.md 第8条：女进度条停滞监测（仅实验切换模式）。
-            # 首次运行 / 切换实验后 / 每轮点击「开始」后：须先模板匹配到特殊动作按钮，再启动停滞检测（超时见 FEMALE_BAR_STALL_NO_INCREASE_SECONDS）。
-            if experiment_switch_enabled:
-                self._female_bar_stall_flag = False
-                self._female_bar_monitor_active = True
-                self._female_bar_stall_suspend_until = 0.0
-                self._female_bar_stall_wait_special_visible_after_start = True
+
+            # 所有模式统一启用女进度条停滞监测
+            self._female_bar_stall_flag = False
+            self._female_bar_monitor_active = True
+            self._female_bar_stall_suspend_until = 0.0
+            self._female_bar_stall_wait_special_visible_after_start = True
             self._female_bar_stall_wait_special_reappear = False
             self._female_bar_stall_reappear_earliest_ts = 0.0
-            # 新一轮「开始~高潮」阶段：刷新令牌，使旧线程中待发送的「1」全部失效。
-            self._special_action_phase_token += 1
-            self._special_action_expected_token = self._special_action_phase_token
-            self._special_action_monitor_active = True
 
-            # 仅在“点击开始后~点击高潮前”阶段启用滚轮纠偏。
+            # 特殊动作监测仍然仅实验切换时启用（避免未标定时按键干扰）
+            if experiment_switch_enabled:
+                self._special_action_phase_token += 1
+                self._special_action_expected_token = self._special_action_phase_token
+                self._special_action_monitor_active = True
+
             self._scroll_enabled = True
             stall_detected = False
             try:
                 while not self.actions.ready_to_cum():
                     if self._wait_if_paused_or_interrupted():
                         return
-                    # 流程.md 第8条：检查停滞标志
-                    if experiment_switch_enabled and self._female_bar_stall_flag:
+                    # 通用停滞检测，不再受限实验切换
+                    if self._female_bar_stall_flag:
                         stall_detected = True
                         break
                     self.state.log("等待高潮")
                     now = time()
-                    # 高频闭环：约每 0.4 秒做一次纠偏，避免进度条差距扩散过快。
-                    # 约定固定为：
-                    # - b1 = 女进度条（原上方进度条）
-                    # - b2 = 男进度条（原下方进度条）
                     if now >= next_balance_check_at:
                         b1, b2 = self.vision_service.detect_bars(self.vision_service.capture_screen())
-                        # EMA：用平滑后的填充率算 diff，抑制单帧跳变导致的纠偏方向抖动。
                         if bar_fill_ema_b1 is None:
                             bar_fill_ema_b1, bar_fill_ema_b2 = b1, b2
                         else:
@@ -1380,12 +1384,10 @@ class AutomationEngine:
                                 f"ema f={bar_fill_ema_b1:.4f} m={bar_fill_ema_b2:.4f} diff={diff:.4f}"
                             )
 
-                        # 仅当平滑后的 |diff| 超出死区才纠偏；力度随 |diff| 分档，并整体压低批次避免过冲。
                         if abs(diff) > bar_balance_tolerance:
                             self.actions.move_to_scroll_region_center()
 
                             ad = abs(diff)
-                            # 更细分档：在中小差值区间提供更细腻纠偏。
                             if ad > 0.18:
                                 scroll_count = 24
                             elif ad > 0.12:
@@ -1399,41 +1401,32 @@ class AutomationEngine:
                             else:
                                 scroll_count = 6
 
-                            # 临近满条时略加大纠偏，但增量减半以减轻末端抖动。
                             if max(bar_fill_ema_b1, bar_fill_ema_b2) > 0.85 and abs(diff) > bar_balance_tolerance:
                                 scroll_count += 4
 
                             scroll_count = max(4, min(28, scroll_count))
 
-                            # 速度纠偏：滚轮方向相对上一版整体取反（pyautogui.scroll 正数为常见“向上滚”语义）。
                             if diff > 0:
-                                # 女进度条 > 男进度条：原方向取反后使用 +360。
                                 if self.state.debug:
                                     print(f"[bar] action=scroll_up sign=+ (female ahead) count={scroll_count}")
                                 self._set_scroll_command(+360, scroll_count)
                             else:
-                                # 女进度条 < 男进度条：原方向取反后使用 -360。
                                 if self.state.debug:
                                     print(f"[bar] action=scroll_down sign=- (female behind) count={scroll_count}")
                                 self._set_scroll_command(-360, scroll_count)
                         else:
-                            # 差值已在容差内：暂停副线程滚轮输出，避免多余扰动。
                             self._clear_scroll_command()
                         next_balance_check_at = now + balance_check_interval_sec
-                    # 主线程优先响应按钮检测，轮询频率高于滚轮参数刷新频率。
                     sleep(0.06)
             finally:
-                # 无论正常进入高潮、手动中断或异常，都立即停滚轮并停用停滞监测。
                 self._scroll_enabled = False
                 self._clear_scroll_command()
                 self._female_bar_monitor_active = False
                 self._special_action_monitor_active = False
-                # 离开阶段：递增令牌，使特殊动作线程内任何未完成的延迟按键被取消。
                 self._special_action_phase_token += 1
 
             if not stall_detected:
                 break
-
             if not self._recover_after_female_bar_stall(bar_balance_tolerance=bar_balance_tolerance):
                 return
 
