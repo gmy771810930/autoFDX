@@ -577,10 +577,11 @@ class GameActions:
         norm = rect_map.get(key)
         if (not isinstance(norm, list)) or len(norm) != 4:
             return None
+        left, top, _, _ = self.window_service.get_window_region()
         x1, y1, x2, y2 = self.window_service.denormalize_region(norm)
         if x2 <= x1 or y2 <= y1:
             return None
-        shot = pyautogui.screenshot(region=(x1, y1, x2 - x1, y2 - y1))
+        shot = pyautogui.screenshot(region=(left + x1, top + y1, x2 - x1, y2 - y1))
         return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
 
     def _build_red_mask(self, bgr_img):
