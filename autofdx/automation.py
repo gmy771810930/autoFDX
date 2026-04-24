@@ -1352,10 +1352,9 @@ class AutomationEngine:
             self._female_bar_stall_reappear_earliest_ts = 0.0
 
             # 特殊动作监测仍然仅实验切换时启用（避免未标定时按键干扰）
-            if experiment_switch_enabled:
-                self._special_action_phase_token += 1
-                self._special_action_expected_token = self._special_action_phase_token
-                self._special_action_monitor_active = True
+            self._special_action_phase_token += 1
+            self._special_action_expected_token = self._special_action_phase_token
+            self._special_action_monitor_active = True
 
             self._scroll_enabled = True
             stall_detected = False
