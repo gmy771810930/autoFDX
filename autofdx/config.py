@@ -93,7 +93,7 @@ def build_default_config():
         "like_pool_ring_width_ratio": 0.14,
         # 圆环内蓝色像素占比 ≥ 该阈值视为「赞池满」。
         # 主模式：成功点击再来一次后检测一次；单高潮：主循环约每 5 秒检测。
-        "like_pool_blue_full_threshold": 0.90,
+        "like_pool_blue_full_threshold": 0.60,
         # 实验切换网格（3x4，共 12 点）：
         # - experiment_points: 按“从左到右、从上到下”顺序存储 12 个点（归一化坐标）。
         # - current_experiment: 当前实验索引，采用 [行, 列]（1-based）表示。
